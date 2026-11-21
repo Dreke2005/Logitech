@@ -1,3 +1,5 @@
+#$env:LOGIWEBCAM_USER = "your_username"
+#$env:LOGIWEBCAM_PASSWORD = "your_password"
 #!/usr/bin/env python3
 """
 Copyright (c) 2026 Logitech Europe S.A.
