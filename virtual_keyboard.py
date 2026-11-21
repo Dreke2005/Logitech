@@ -1,14 +1,18 @@
 """Render the calibrated tap keyboard and keep its typed text."""
 
+import math
+
 import cv2
 import numpy as np
 
-from typing_calibration import PoseCalibration
+from typing_calibration import MAX_FRAME_GAP_MS, PoseCalibration
 from typing_taps import TapDetector
 
 FONT = cv2.FONT_HERSHEY_SIMPLEX
 RESUME_HOLD_MS = 120
-DEPARTURE_HOLD_MS = 1600
+PAUSE_NOTICE_MS = 200
+THUMB_RELEASE = 2.0
+THUMB_RELEASE_HOLD_MS = 400
 
 
 class VirtualKeyboard:
@@ -20,9 +24,7 @@ class VirtualKeyboard:
         self.reference = None
         self.last_key = None
         self.highlight_until = 0
-        self._paused = False
-        self._departure_since = None
-        self._resume_since = None
+        self._reset_gate()
 
     @property
     def keys(self):
@@ -35,9 +37,46 @@ class VirtualKeyboard:
         self.shift = False
         self.last_key = None
         self.highlight_until = 0
-        self._paused = False
-        self._departure_since = None
+        self._reset_gate()
+
+    def _reset_gate(self):
+        self._frame_ms = None
+        self._pause_since = None
         self._resume_since = None
+        self._opening_since = None
+        self._opening_last_ms = None
+
+    def _pause(self, timestamp):
+        if self._pause_since is None:
+            self._pause_since = timestamp
+        self.last_key = None
+        self._resume_since = None
+
+    def _handle_thumb_release(self, tracking, timestamp):
+        """Keep the layout until a wide thumb gap is observed continuously."""
+        width, height = self.reference.frame_size
+        tips = [hand["fingertips"]["thumb"]["pixel"] for hand in tracking["hands"]]
+        palms = self.reference.palm_sizes
+        separated = (
+            len(tips) == 2
+            and all(0 <= x < width and 0 <= y < height for x, y in tips)
+            and math.dist(*tips) > THUMB_RELEASE * (sum(palms) / 2)
+        )
+        if not separated:
+            self._opening_since = None
+            self._opening_last_ms = None
+            return False
+        if self._opening_last_ms is None or not 0 < timestamp - self._opening_last_ms <= MAX_FRAME_GAP_MS:
+            self._opening_since = timestamp
+        self._opening_last_ms = timestamp
+        self._pause(timestamp)
+        self.taps.reset()
+        if timestamp - self._opening_since >= THUMB_RELEASE_HOLD_MS:
+            self.reset_calibration()
+        return True
+
+    def _show_pause(self):
+        return self._pause_since is not None and self._frame_ms - self._pause_since >= PAUSE_NOTICE_MS
 
     def update(self, tracking):
         if self.reference is not None and tuple(tracking["frame_size"]) != self.reference.frame_size:
@@ -48,19 +87,15 @@ class VirtualKeyboard:
                 return
 
         timestamp = tracking["timestamp_ms"]
+        self._frame_ms = timestamp
+        if self._handle_thumb_release(tracking, timestamp):
+            return
         pressed_keys = self.taps.update(tracking, self.reference)
         if not self.taps.active:
-            self._paused = True
-            self.last_key = None
-            self._resume_since = None
-            if self._departure_since is None:
-                self._departure_since = timestamp
-            elif timestamp - self._departure_since >= DEPARTURE_HOLD_MS:
-                self.reset_calibration()
+            self._pause(timestamp)
             return
 
-        self._departure_since = None
-        if self._paused:
+        if self._pause_since is not None:
             if self._resume_since is None:
                 self._resume_since = timestamp
             if timestamp - self._resume_since >= RESUME_HOLD_MS:
@@ -68,7 +103,7 @@ class VirtualKeyboard:
                 # tap after resuming. Seed a fresh baseline at the current pose.
                 self.taps.reset()
                 self.taps.update(tracking, self.reference)
-                self._paused = False
+                self._pause_since = None
                 self._resume_since = None
             return
 
@@ -98,11 +133,12 @@ class VirtualKeyboard:
             return
 
         layer = frame.copy()
+        show_pause = self._show_pause()
         for key in self.keys:
-            fill = (55, 56, 62) if self._paused else (37, 42, 53)
+            fill = (55, 56, 62) if show_pause else (37, 42, 53)
             if key.label == self.last_key:
                 fill = (92, 230, 160)
-            elif not self._paused and key.label == self.taps.hovered_key:
+            elif self._pause_since is None and key.label == self.taps.hovered_key:
                 fill = (117, 105, 63)
             elif key.label == "Shift" and self.shift:
                 fill = (170, 102, 64)
@@ -135,7 +171,10 @@ class VirtualKeyboard:
         scale = min(0.6, width / 960)
         top = frame.shape[0]
         panel = cv2.copyMakeBorder(frame, 0, 99, 0, 0, cv2.BORDER_CONSTANT, value=(25, 30, 41))
-        if self._paused:
+        show_pause = self._show_pause()
+        if show_pause and self._opening_since is not None:
+            hint = "Keep your thumbs apart to dismiss the keyboard."
+        elif show_pause:
             hint = "Paused. Bring both hands back to the keyboard."
         elif self.reference is not None:
             hint = "Ready. Tap a finger down and lift it."

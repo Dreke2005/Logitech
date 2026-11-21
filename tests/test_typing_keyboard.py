@@ -255,9 +255,9 @@ class TypingKeyboardTests(unittest.TestCase):
                 self.assertIs(keyboard.reference, reference)
                 self.assertEqual(keyboard.text, "f")
                 for offset in (250, 310, 370):
-                    keyboard.update(frame(start + offset, thumb_x=280))
-                keyboard.update(frame(start + 420, tap=9, thumb_x=280))
-                keyboard.update(frame(start + 470, thumb_x=280))
+                    keyboard.update(frame(start + offset, thumb_x=296))
+                keyboard.update(frame(start + 420, tap=9, thumb_x=296))
+                keyboard.update(frame(start + 470, thumb_x=296))
                 self.assertIs(keyboard.reference, reference)
                 self.assertEqual(keyboard.text, "ff")
 
@@ -265,35 +265,68 @@ class TypingKeyboardTests(unittest.TestCase):
         keyboard = VirtualKeyboard()
         start = self.activate(keyboard)
         reference = keyboard.reference
-        keyboard.update(frame(start, move=(5, 6), thumb_x=283))
-        keyboard.update(frame(start + 50, move=(6, 6), tap=9, thumb_x=286))
-        keyboard.update(frame(start + 100, move=(5, 6), thumb_x=283))
+        keyboard.update(frame(start, move=(5, 6), thumb_x=296))
+        keyboard.update(frame(start + 50, move=(6, 6), tap=9, thumb_x=297))
+        keyboard.update(frame(start + 100, move=(5, 6), thumb_x=296))
         self.assertIs(keyboard.reference, reference)
         self.assertEqual(keyboard.text, "f")
 
-    def test_sustained_departure_needs_deliberate_rearm(self):
+    def test_layout_waits_for_thumb_release_before_reanchoring(self):
         keyboard = VirtualKeyboard()
         start = self.activate(keyboard)
         reference = keyboard.reference
         self.tap_f(keyboard, start)
-        for offset in range(150, 1750, 100):
+        for offset in range(150, 2350, 100):
+            keyboard.update(frame(start + offset, move=(0, 66)))
+            self.assertIs(keyboard.reference, reference)
+        for offset in range(2350, 2750, 100):
             keyboard.update(frame(start + offset, move=(0, 66), thumb_x=280))
             self.assertIs(keyboard.reference, reference)
-        for offset in range(1750, 2650, 100):
-            keyboard.update(frame(start + offset, move=(0, 66), thumb_x=280))
-            self.assertIsNone(keyboard.reference)
-        for offset in range(2650, 3450, 50):
+        keyboard.update(frame(start + 2750, move=(0, 66), thumb_x=280))
+        self.assertIsNone(keyboard.reference)
+        for offset in range(2800, 3600, 50):
             keyboard.update(frame(start + offset, move=(0, 66)))
         self.assertIsNotNone(keyboard.reference)
         self.assertEqual(keyboard.reference.thumb_anchor, (320, 326))
+        self.assertEqual(keyboard.text, "f")
+
+    def test_thumb_release_cancels_taps_and_requires_continuous_samples(self):
+        keyboard = VirtualKeyboard()
+        start = self.activate(keyboard)
+        reference = keyboard.reference
+        keyboard.update(frame(start, tap=9))
+        keyboard.update(frame(start + 50, thumb_x=280))
+        keyboard.update(frame(start + 200, thumb_x=280))
+        self.assertIs(keyboard.reference, reference)
+        self.assertEqual(keyboard.text, "")
+
+        keyboard.update(frame(start + 300, one_hand=True))
+        for offset in (400, 500, 600, 700):
+            keyboard.update(frame(start + offset, thumb_x=280))
+            self.assertIs(keyboard.reference, reference)
+        keyboard.update(frame(start + 800, thumb_x=280))
+        self.assertIsNone(keyboard.reference)
+
+    def test_one_wide_sample_cancels_tap_without_visual_pause(self):
+        keyboard = VirtualKeyboard()
+        start = self.activate(keyboard)
+        reference = keyboard.reference
+        keyboard.update(frame(start, tap=9))
+        keyboard.update(frame(start + 50, thumb_x=280))
+        for offset in (100, 160, 220):
+            keyboard.update(frame(start + offset))
+            self.assertFalse(keyboard._show_pause())
+        self.assertIs(keyboard.reference, reference)
+        self.assertEqual(keyboard.text, "")
+        self.tap_f(keyboard, start + 250)
         self.assertEqual(keyboard.text, "f")
 
     def test_repeated_dropouts_do_not_accumulate_as_a_departure(self):
         keyboard = VirtualKeyboard()
         start = self.activate(keyboard)
         reference = keyboard.reference
-        for offset in range(0, 2200, 50):
-            keyboard.update(frame(start + offset, one_hand=offset % 100 == 0))
+        for offset in range(0, 3200, 50):
+            keyboard.update(frame(start + offset, one_hand=offset % 100 == 0 or offset > 1600))
         self.assertIs(keyboard.reference, reference)
         self.assertEqual(keyboard.text, "")
 
@@ -334,7 +367,7 @@ class TypingKeyboardTests(unittest.TestCase):
         tracks += [frame(900, tap=9), frame(950)]
         context = Mock()
         context.Queue.return_value.get.side_effect = [
-            ("frame", (np.zeros((480, 640, 3), dtype=np.uint8), tracking))
+            ("frame", (np.zeros((480, 640, 3), dtype=np.uint8), tracking, None))
             for tracking in tracks
         ]
 

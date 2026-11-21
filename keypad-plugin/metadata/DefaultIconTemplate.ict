@@ -1,0 +1,21 @@
+{
+  "backgroundColor": 4279770148,
+  "items": [
+    {
+      "$type": "Loupedeck.Service.ActionIconImageItem, LoupedeckShared",
+      "image": "",
+      "imageFileName": null,
+      "imageColor": 4294967295,
+      "imageRotation": "None",
+      "isVisible": true,
+      "itemType": "Image",
+      "area": {
+        "x": 0,
+        "y": 0,
+        "width": 100,
+        "height": 100,
+        "isFullScreen": true
+      }
+    }
+  ]
+}

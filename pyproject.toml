@@ -14,14 +14,10 @@ dependencies = [
     "scipy>=1.10.0",
     "matplotlib>=3.7.0",
     "pygrabber>=0.2",
-<<<<<<< HEAD
     # PC hand tracking; use one GUI OpenCV distribution shared with MediaPipe.
     "mediapipe>=0.10.21,<0.11",
     "opencv-contrib-python>=4.8",
-=======
-    "mediapipe>=1.2.3",
     "pyautogui>=0.9.54",
->>>>>>> a259137be23d529f9c511aaa17658b13df505ba5
 ]
 
 [dependency-groups]
