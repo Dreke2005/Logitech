@@ -7,3 +7,5 @@ ir_captures/
 *:Zone.Identifier
 audio_captures/
 *.wav
+models/*.task
+models/*.download
