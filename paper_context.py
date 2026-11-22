@@ -36,6 +36,9 @@ class WritingContext:
     kinds: tuple = ("text",)
     end_circle: bool = True  # Whether a small closed circle drawn last ends the recording.
     language: str = ""
+    # "ocr": the writing is text, equations, code, or rows, read by the fast text reader.
+    # "vision": boxes, arrows, and symbols carry the meaning, so the picture goes to the vision model.
+    reader: str = "ocr"
 
     @property
     def prompt(self):
@@ -47,8 +50,10 @@ PROJECT = WritingContext(
     "One line per class or idea with its members, and relations written as A -> B. Keep names exactly.",
     "text", ("diagram", "outline", "pseudocode"))
 PLOT = WritingContext(
-    "One function of x to plot, optionally with a written x range on its own line.",
-    "y = <expression in x> using ^ for powers and * for products; a range goes on its own line.",
+    "One function of x to plot, or a few of them on separate lines, optionally with a written x range on its "
+    "own line.",
+    "y = <expression in x> using ^ for powers and * for products, one function per line; a range such as "
+    "-2 <= x <= 2 goes on its own line.",
     "plot", ("equation",))
 
 CONTEXTS = {
@@ -81,12 +86,13 @@ CONTEXTS = {
         "The notes as short lines in reading order, arrows as ->.", "text", ("outline", "diagram", "text")),
     ("KiCad", "circuit"): WritingContext(
         "A circuit sketch with component references (R1, C2, L1, D1), values, and net labels.",
-        "One component per line: reference, value, and its two net labels.", "text", ("diagram", "text")),
+        "One component per line: reference, value, and its two net labels.", "text", ("diagram", "text"),
+        reader="vision"),
     ("LTspice", "circuit"): WritingContext(
         "A circuit sketch to simulate: sources (V1, I1), resistors, capacitors, inductors, and diodes with "
         "values, net labels, a ground symbol, and possibly a command such as .tran 10m or .ac dec 20 1 1Meg.",
         "One component per line: reference, value, and its two net labels; then the simulation command.",
-        "text", ("diagram", "text")),
+        "text", ("diagram", "text"), reader="vision"),
     ("Git", "repo"): WritingContext(
         "A software project idea for a new repository: its title, goals, components, and class names.",
         "The idea as short lines: title first, then goals and components.", "text",
@@ -106,7 +112,16 @@ CONTEXTS = {
         "starts a new branch; a line joining back into a branch is a merge.",
         "One command per line, in time order from left to right, using only: branch <name> [from <parent>] | "
         'commit <branch> "<message>" | merge <source> into <target> | push <branch>.',
-        "diagram", ("diagram",), end_circle=False),
+        "diagram", ("diagram",), end_circle=False, reader="vision"),
+    ("Git", "auto"): WritingContext(
+        "A git branch diagram drawn on the version-control page without a key press: horizontal lines are "
+        "branches with their names written at the start, dots on a line are commits. A circle around a node "
+        "means commit at that node, with the text next to it as the message. A circle around a branch name "
+        "means push that branch. A line forking off a branch starts a new branch; a line joining back into a "
+        "branch is a merge.",
+        "One command per line, in time order from left to right, using only: branch <name> [from <parent>] | "
+        'commit <branch> "<message>" | merge <source> into <target> | push <branch>.',
+        "diagram", ("diagram",), end_circle=False, reader="vision"),
     ("*", "issue"): WritingContext(
         "An issue for a software project: a short title on the first line, then a few lines describing the bug "
         "or the wanted feature.",
@@ -121,7 +136,11 @@ CONTEXTS = {
         "some with labels such as yes and no.",
         "Mermaid flowchart source: the first line 'flowchart TD', then one line per arrow such as "
         "A[Start] --> B{Valid?} or B -->|yes| C[Save]. Give every box a short id (A, B, C) and keep its label.",
-        "flow", ("diagram",), end_circle=False),
+        "flow", ("diagram",), end_circle=False, reader="vision"),
+    ("ChatGPT", "image"): WritingContext(
+        "A freehand drawing that ChatGPT turns into a finished image.",
+        "Nothing is transcribed: the picture itself is used.", "text", ("diagram",), end_circle=False,
+        reader="vision"),
     ("Plan", "gantt"): WritingContext(
         "A project plan written while brainstorming: tasks from top to bottom, each with a duration such as "
         "2w or 3d, arrows meaning 'then', and milestones marked with a star, diamond, or the word milestone.",
@@ -327,12 +346,27 @@ def _sympy_accepts(line):
         return False
 
 
+def python_block(text):
+    """Python source in which a block header written without its body ('for i in range(10):')
+    gets a placeholder body, so a line of handwriting is judged as the code it is."""
+    lines = text.rstrip().splitlines()
+    result = []
+    for index, line in enumerate(lines):
+        result.append(line)
+        if line.rstrip().endswith(":") and not line.lstrip().startswith("#"):
+            indent = len(line) - len(line.lstrip())
+            following = next((other for other in lines[index + 1:] if other.strip()), None)
+            if following is None or len(following) - len(following.lstrip()) <= indent:
+                result.append(" " * (indent + 4) + "pass")
+    return "\n".join(result) + "\n"
+
+
 def check_code(text, language):
     if not text.strip():
         return "empty reading"
     if language in ("Python", "PyTorch"):
         try:
-            ast.parse(text)
+            ast.parse(python_block(text))
             return None
         except SyntaxError as error:
             if all(check_equation(line) is None for line in text.splitlines() if line.strip()):
@@ -369,18 +403,17 @@ def check_table(text):
 
 
 def check_plot(text):
-    from paper_transfer import graph
+    from paper_transfer import plot_spec
 
-    with tempfile.TemporaryDirectory() as folder:
-        try:
-            graph(text, Path(folder))
-        except (ValueError, ArithmeticError) as error:
-            return str(error)
+    try:
+        plot_spec(text)  # Functions of x and an optional range; nothing is drawn for the check.
+    except (ValueError, ArithmeticError) as error:
+        return str(error)
     return None
 
 
 REF = r"[A-Za-z0-9][A-Za-z0-9._/-]*"
-DIAGRAM = [re.compile(rf"branch ({REF})(?: from ({REF}))?"), re.compile(rf'commit ({REF}) "([^"]+)"'),
+DIAGRAM = [re.compile(rf"branch ({REF})(?: from ({REF}))?"), re.compile(rf'commit (?:({REF}) )?"([^"]+)"'),
            re.compile(rf"merge ({REF}) into ({REF})"), re.compile(rf"push ({REF})")]
 
 

@@ -1,3 +1,4 @@
+import hermetic  # noqa: F401
 import subprocess
 import tempfile
 import unittest
@@ -124,6 +125,40 @@ class ForgeTests(unittest.TestCase):
         self.assertTrue(url.startswith("https://gitlab.com/grp/r/-/merge_requests/new?"))
         self.assertIn("merge_request%5Bsource_branch%5D=fix", url)
         self.assertIn("merge_request%5Btarget_branch%5D=main", url)
+
+
+class GeneratedCodeTests(unittest.TestCase):
+    def test_latex_in_an_f_string_is_repaired_and_the_values_still_print(self):
+        from paper_conversion import compiles, repair_python
+
+        broken = ("def y(x):\n    return sum(x ** i for i in range(1, 5)) + 3\n\n"
+                  "print(f\"y(x) = \\\\sum_{i=1}^{4} x^i + 3 = {y(1)}\")\n")
+        self.assertFalse(compiles(broken)[0])
+        fixed, notes = repair_python(broken)
+        self.assertTrue(compiles(fixed)[0], fixed)
+        namespace = {}
+        import contextlib
+        import io
+        printed = io.StringIO()
+        with contextlib.redirect_stdout(printed):
+            exec(compile(fixed, "draft", "exec"), namespace)
+        self.assertIn("= 7", printed.getvalue())
+        self.assertIn("braces were escaped", notes[0])
+
+    def test_any_other_broken_line_is_commented_out(self):
+        from paper_conversion import compiles, repair_python
+
+        fixed, notes = repair_python("x = 1\ny = (2 +\nz = 3\n")
+        self.assertTrue(compiles(fixed)[0])
+        self.assertIn("commented out", notes[-1])
+
+    def test_the_code_model_gets_plain_math(self):
+        from paper_conversion import plain_math
+
+        plain = plain_math("y(x) = \\sum_{i=1}^{4} x^i + 3\n\\Delta y (x)")
+        self.assertNotIn("\\", plain)
+        self.assertNotIn("{", plain)
+        self.assertIn("sum over i = 1 .. 4 of x^i + 3", plain)
 
 
 if __name__ == "__main__":

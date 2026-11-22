@@ -1,3 +1,4 @@
+import hermetic  # noqa: F401
 import unittest
 
 from pinch_zoom import MAX_NOTCHES, PinchZoom

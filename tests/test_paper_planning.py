@@ -1,3 +1,4 @@
+import hermetic  # noqa: F401
 import json
 import subprocess
 import tempfile
@@ -34,13 +35,19 @@ class PlanTests(unittest.TestCase):
         self.assertIn("Prototype :t1, 2026-01-19, 21d", chart)
         self.assertIn("Demo :milestone, m2, 2026-02-09, 0d", chart)
 
-    def test_unknown_lines_and_references_are_reported(self):
-        items, problems = paper_plan.parse_plan("task: A, 1w\nsomething else\ntask: B, 2d, after Nowhere")
-        self.assertEqual(len(items), 2)
-        self.assertIn("Not a task or milestone", problems[0])
+    def test_lines_are_read_as_written_on_paper(self):
+        written = "Literature review 2w\nPrototype 3w\n* Demo\nReport 10d after Prototype\nHand-in milestone\n12 34"
+        items, problems = paper_plan.parse_plan(written)
+        self.assertEqual(problems, [])
+        self.assertEqual([(item.name, item.days, item.after) for item in items],
+                         [("Literature review", 14, ""), ("Prototype", 21, ""), ("Demo", 0, ""),
+                          ("Report", 10, "Prototype"), ("Hand-in", 0, "")])
+        items, _ = paper_plan.parse_plan("task: A, 1w\ntask: B, 2d, after Nowhere")
         self.assertIn("Nowhere", paper_plan.schedule(items, date(2026, 1, 5))[0])
         self.assertEqual(validate_reading("Plan", "gantt", self.PLAN), (True, ""))
+        self.assertEqual(validate_reading("Plan", "gantt", "Design 2w\nBuild 3w"), (True, ""))
         self.assertFalse(validate_reading("Plan", "gantt", "buy milk")[0])
+        self.assertFalse(validate_reading("Plan", "gantt", "buy milk\ncall home")[0])
 
     def test_chart_is_rendered_as_png_and_pdf(self):
         items, _ = paper_plan.parse_plan(self.PLAN)
@@ -94,3 +101,39 @@ class RemoteTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FrontAppTests(unittest.TestCase):
+    def test_windows_map_to_keypad_pages(self):
+        cases = {("Code.exe", "main.py - project - Visual Studio Code"): "vscode",
+                 ("Code.exe", "main.tex - report - Visual Studio Code"): "latex",
+                 ("chrome.exe", "Overleaf, Online LaTeX Editor - Google Chrome"): "latex",
+                 ("chrome.exe", "ChatGPT - Google Chrome"): "chatgpt", ("chrome.exe", "News"): None,
+                 ("MATLAB.exe", "MATLAB R2026a"): "matlab", ("LTspice.exe", "LTspice"): "ltspice",
+                 ("WindowsTerminal.exe", "pwsh"): None}
+        for window, page in cases.items():
+            with self.subTest(window=window):
+                self.assertEqual(paper_project.app_for_window(*window), page)
+
+    def test_every_app_page_has_version_control_and_page_one_has_none(self):
+        menus = json.loads((Path(__file__).parents[1] / "paper_menus.json").read_text(encoding="utf-8"))
+        apps = [button[0] for button in menus["home"] if button[0] != "start"]
+        self.assertNotIn("git", apps)
+        self.assertNotIn("git", [button[0] for button in menus["start"]])
+        for app in apps:
+            with self.subTest(app=app):
+                keys = [button[0] for button in menus[app]]
+                self.assertIn("git", keys)
+                self.assertLessEqual(len(keys), 9)
+                self.assertEqual(keys[0], "camera")
+
+    def test_start_page_has_the_webcam_first_and_the_stock_keys(self):
+        menus = json.loads((Path(__file__).parents[1] / "paper_menus.json").read_text(encoding="utf-8"))
+        keys = [button[0] for button in menus["start"]]
+        self.assertEqual(keys[0], "webcam")
+        self.assertEqual(len(keys), 9)
+        icons = Path(__file__).parents[1] / "keypad-plugin" / "icons" / "operations"
+        for key in keys:
+            with self.subTest(key=key):
+                self.assertTrue((icons / f"{key}.png").is_file())
+        self.assertIn("start", [button[0] for button in menus["home"]])

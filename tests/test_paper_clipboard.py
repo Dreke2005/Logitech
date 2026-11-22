@@ -1,3 +1,4 @@
+import hermetic  # noqa: F401
 import shutil
 import tempfile
 import unittest
@@ -295,7 +296,8 @@ class WorkbenchPasteTests(unittest.TestCase):
 
         import paper_workbench
 
-        bench = SimpleNamespace(results=queue.SimpleQueue(), args=SimpleNamespace(model="local"))
+        bench = SimpleNamespace(results=queue.SimpleQueue(), args=SimpleNamespace(model="local"),
+                                _checked=lambda source, *_: source)
         readings = {"copy": "KIND: plot\ny = sin(x)\n0 <= x <= 2", "table": "a | b\n1 | 2",
                     "diagram": "branch x from main"}
         with patch.object(paper_workbench, "ROOT", self.folder), \
@@ -312,6 +314,46 @@ class WorkbenchPasteTests(unittest.TestCase):
                     self.assertTrue(figure.is_relative_to(self.folder / "figures"))
                 else:
                     self.assertIsNone(figure)
+
+    def test_the_reading_is_checked_with_the_user_before_generating(self):
+        import json
+
+        import paper_workbench
+
+        replies = []
+
+        def show(source, workflow, answer, done):
+            shown.append(source)
+            answer.update(replies.pop(0))
+            done.set()
+
+        bench = SimpleNamespace(confirm_enabled=True, debug_folder=None, target="VS Code",
+                                CONFIRMED=paper_workbench.PaperWorkbench.CONFIRMED,
+                                status=SimpleNamespace(set=lambda _text: None),
+                                window=SimpleNamespace(after=lambda _delay, function, *args: function(*args)))
+        bench._show_confirm, bench._close_confirm = show, lambda: None
+        bench._log_correction = lambda read, corrected, workflow: paper_workbench.PaperWorkbench._log_correction(
+            bench, read, corrected, workflow)
+        confirm = paper_workbench.PaperWorkbench.confirm_reading
+        with patch.object(paper_workbench, "ROOT", self.folder):
+            shown = []
+            replies[:] = [{"choice": "ok", "text": "y = x^2 + 1"}]
+            self.assertEqual(confirm(bench, "y = x^2 + 1", "equation"), "y = x^2 + 1")
+            self.assertFalse((self.folder / "corrections.jsonl").exists())
+            # Edited in the check: the edit is used and logged as a correction.
+            replies[:] = [{"choice": "ok", "text": "y = x^2 - 1"}]
+            self.assertEqual(confirm(bench, "y = x^2 + 1", "equation"), "y = x^2 - 1")
+            logged = json.loads((self.folder / "corrections.jsonl").read_text(encoding="utf-8").splitlines()[-1])
+            self.assertEqual((logged["read"], logged["corrected"]), ("y = x^2 + 1", "y = x^2 - 1"))
+            # Read again: a second reading is shown and confirmed.
+            shown = []
+            replies[:] = [{"choice": "again"}, {"choice": "ok", "text": "z = 2x"}]
+            self.assertEqual(confirm(bench, "z = 2+", "graph", lambda previous: "z = 2x"), "z = 2x")
+            self.assertEqual(shown, ["z = 2+", "z = 2x"])
+            replies[:] = [{"choice": "cancel"}]
+            self.assertIsNone(confirm(bench, "print(1)", "default"))
+            # Keys whose result is not code, a plot, an equation, or a table are not held up.
+            self.assertEqual(confirm(bench, "branch x from main", "diagram"), "branch x from main")
 
 
 if __name__ == "__main__":

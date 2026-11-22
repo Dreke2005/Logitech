@@ -104,6 +104,23 @@ def main():
         x0, y0, x1, y1 = selection.page.bounds
         print(f"Writing region {x1 - x0}x{y1 - y0} px at ({x0},{y0}); {len(selection.strokes)} strokes; "
               f"letter height about {selection.text_height:.0f} px; rotation {selection.rotation}")
+        offset = session.tip_offset
+        print(f"Pen-tip correction learned from the ink: ({offset[0]:+.0f}, {offset[1]:+.0f}) px")
+        if selection.ink is None:
+            print("No ink was registered: the writing is too faint for this camera, or it stayed covered.")
+        else:
+            import paper_reader
+
+            dark = int((selection.ink[:, :, 0] < 170).sum())
+            started = time.perf_counter()
+            try:
+                text = paper_reader.read_picture(selection.ink, selection.text_height, "text",
+                                                 rotation=selection.rotation)
+            except (RuntimeError, ValueError) as error:
+                text = f"<{error}>"
+            print(f"Ink registered: {dark} px. Read in {time.perf_counter() - started:.2f} s as: {text!r}")
+            if args.save:
+                cv2.imwrite(str(args.save.with_name(args.save.stem + "_ink.png")), selection.ink)
     if args.save:
         overlay = session.draw(frame, time.monotonic())
         if selection is not None:

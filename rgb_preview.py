@@ -17,7 +17,7 @@ CALIBRATION_WINDOW = "Gaze calibration"
 
 
 def _capture(device, backend, width, height, output, stop, model_path=None, mirror=False,
-             eye_model_path=None):
+             eye_model_path=None, exposure_lock=None):
     """Isolate native camera calls so a blocked driver can be stopped."""
     from camera_utils import open_camera
 
@@ -39,13 +39,30 @@ def _capture(device, backend, width, height, output, stop, model_path=None, mirr
                 width=width, height=height, fourcc="MJPG", fps=30,
             )
             resources.callback(cap.release)
-            while not stop.is_set():
+            exposure = None
+            if exposure_lock is not None:
+                # Paper mode: keep the paper bright but not clipped, and steady while a recording runs.
+                from paper_exposure import PaperExposure, PaperFocus
+
+                exposure = PaperExposure(cap)
+                resources.callback(exposure.release)
+                focus = PaperFocus(cap)  # The autofocus hunts between hand and paper; lock it on the paper.
+                resources.callback(focus.release)
+            # Stop when the program that started this worker is gone, even if it was killed: a
+            # worker left behind keeps the camera, and the next program then gets black frames.
+            import multiprocessing
+
+            parent = multiprocessing.parent_process()
+            while not stop.is_set() and (parent is None or parent.is_alive()):
                 ok, frame = cap.read()
                 if not ok or frame is None:
                     stop.wait(0.05)
                     continue
                 if mirror:
                     frame = cv2.flip(frame, 1)
+                if exposure is not None:
+                    exposure.update(frame, locked=exposure_lock.is_set())
+                    focus.update(frame, locked=exposure_lock.is_set())
                 hand_sample = hands.process(frame) if hands is not None else None
                 eye_sample = eyes.process(frame) if eyes is not None else None
                 try:
@@ -57,6 +74,10 @@ def _capture(device, backend, width, height, output, stop, model_path=None, mirr
             output.put(("error", str(exc)), timeout=0.2)
         except queue.Full:
             pass
+    finally:
+        # Do not wait for a frame nobody will read: without this the worker hangs at exit when
+        # its parent is gone, and keeps the process (and on some drivers the camera) alive.
+        output.cancel_join_thread()
 
 
 def _desktop_banner(frame, status, gesture_status, navigation_status=None):

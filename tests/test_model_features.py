@@ -1,3 +1,4 @@
+import hermetic  # noqa: F401
 import json
 import tempfile
 import unittest
@@ -54,7 +55,8 @@ class LipCorrectionTests(unittest.TestCase):
 class PaperConversionTests(unittest.TestCase):
     def test_complete_json_is_usable_at_the_output_limit(self):
         reply = {"done_reason": "length", "message": {"content": '{"source":"y=x^2+2x+1"}'}}
-        with patch("local_model._online", return_value=True), patch("local_model.build_opener") as opener:
+        with patch("local_model._online", return_value=True), patch("local_model.make_room"), \
+                patch("local_model.build_opener") as opener:
             opener.return_value.open.return_value = BytesIO(json.dumps(reply).encode())
             self.assertEqual(chat("local", "", "", {})["source"], "y=x^2+2x+1")
 
@@ -318,8 +320,13 @@ class TraceFirstReadingTests(unittest.TestCase):
     def reply(self, source, clear=True):
         return {"source": source, "notes": [], "kind": "equation", "clear": clear}
 
-    def test_trace_reading_is_confirmed_by_the_photo_of_the_new_ink(self):
+    def test_clear_trace_reading_needs_no_photo(self):
         with patch("paper_conversion.chat", return_value=self.reply("y = x^{2} + 1")) as model:
+            reading = read_recording(_recorded(_equation_strokes()), "LaTeX", "Python", "equation", "local")
+        self.assertEqual((model.call_count, reading.path), (1, "trace"))
+
+    def test_unsure_trace_reading_is_confirmed_by_the_photo_of_the_new_ink(self):
+        with patch("paper_conversion.chat", return_value=self.reply("y = x^{2} + 1", clear=False)) as model:
             reading = read_recording(_recorded(_equation_strokes()), "LaTeX", "Python", "equation", "local")
         self.assertEqual(model.call_count, 2)
         self.assertEqual((reading.path, reading[0]), ("trace+photo", "y = x^{2} + 1"))
@@ -354,17 +361,19 @@ class TraceFirstReadingTests(unittest.TestCase):
         with patch("paper_conversion.chat", side_effect=[self.reply("y = = x^2"), self.reply("y = x^2"),
                                                           self.reply("y = x^2")]) as model:
             reading = read_recording(_recorded(_equation_strokes()), "LaTeX", "Python", "equation", "local")
-        self.assertEqual(model.call_count, 3)
-        self.assertEqual((reading.path, reading[0]), ("trace+photo", "y = x^2"))
+        self.assertEqual(model.call_count, 2)
+        self.assertEqual((reading.path, reading[0]), ("trace", "y = x^2"))
 
     def test_photo_corrects_a_symbol_in_a_valid_but_wrong_trace_reading(self):
-        with patch("paper_conversion.chat", side_effect=[self.reply("y = x^{2} + 7"), self.reply("y = x^{2} + 1")]):
+        with patch("paper_conversion.chat", side_effect=[self.reply("y = x^{2} + 7", clear=False),
+                                                          self.reply("y = x^{2} + 1")]):
             reading = read_recording(_recorded(_equation_strokes()), "LaTeX", "Python", "equation", "local")
         self.assertEqual((reading.path, reading[0]), ("trace+photo", "y = x^{2} + 1"))
         self.assertTrue(any("corrected" in note for note in reading[1]))
 
     def test_photo_that_reads_something_else_only_flags_the_trace_reading(self):
-        with patch("paper_conversion.chat", side_effect=[self.reply("y = x^{2} + 1"), self.reply("a b c d e f g h")]):
+        with patch("paper_conversion.chat", side_effect=[self.reply("y = x^{2} + 1", clear=False),
+                                                          self.reply("a b c d e f g h")]):
             reading = read_recording(_recorded(_equation_strokes()), "LaTeX", "Python", "equation", "local")
         self.assertEqual(reading[0], "y = x^{2} + 1")
         self.assertTrue(any("Check this reading" in note for note in reading[1]))

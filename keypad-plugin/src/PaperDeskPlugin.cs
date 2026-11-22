@@ -134,8 +134,8 @@ public sealed class PaperKey : PluginDynamicCommand
         {
             return PaperIcons.Read("blank", imageSize);
         }
-        // Workbench closed: show the apps; a press starts it.
-        string menu = PageMenus[slot / 9] ?? PaperDeskPlugin.Displayed?.menu ?? "home";
+        // Workbench closed: the start page, with the keypad's own keys and the webcam key that starts it.
+        string menu = PageMenus[slot / 9] ?? PaperDeskPlugin.Displayed?.menu ?? "start";
         return PaperIcons.ForKey(menu, PaperAppFolder.ButtonForSlot(menu, slot % 9), imageSize);
     }
 
@@ -161,12 +161,31 @@ public sealed class PaperKey : PluginDynamicCommand
                 }
                 return;
             }
+            if ((state?.menu ?? "start") == "start")
+            {
+                // The start page: the stock keys work whether or not the workbench runs; the webcam key
+                // starts the workbench (or its camera) and shows the apps.
+                if (PaperAppFolder.ButtonForSlot("start", slot) is not { } button)
+                {
+                    return;
+                }
+                this.Plugin.Log.Info($"Start key {button[0]} pressed.");
+                if (button[0] != "webcam")
+                {
+                    StockKeys.Run(button[0]);
+                }
+                else if (state is null)
+                {
+                    OpenWorkbench(webcam: true);
+                }
+                else
+                {
+                    PaperDeskPlugin.WriteCommand(new { state.session, menu = "start", action = "webcam" });
+                }
+                return;
+            }
             if (state is null)
             {
-                if (PaperAppFolder.HomeRoute(slot) is { } route)
-                {
-                    OpenWorkbench(route);
-                }
                 return;
             }
             if (state.labels[slot] == "")
@@ -181,7 +200,7 @@ public sealed class PaperKey : PluginDynamicCommand
         catch (System.ComponentModel.Win32Exception error) { this.Plugin.Log.Error(error.Message); }
     }
 
-    internal static void OpenWorkbench(string? route = null)
+    internal static void OpenWorkbench(string? route = null, bool webcam = false)
     {
         long now = Environment.TickCount64;
         long previous = Interlocked.Read(ref lastLaunch);
@@ -201,11 +220,113 @@ public sealed class PaperKey : PluginDynamicCommand
         };
         start.ArgumentList.Add(launcher.script);
         start.ArgumentList.Add("--background");  // Started from the keypad: stay out of the way.
-        if (route is not null)
+        if (webcam)
+        {
+            start.ArgumentList.Add("--webcam");
+        }
+        else if (route is not null)
         {
             start.ArgumentList.Add("--route");
             start.ArgumentList.Add(route);
         }
         using var process = Process.Start(start);
+    }
+}
+
+/// <summary>The keypad's stock keys, kept on the start page: media, mute, emoji, screenshot, Explorer,
+/// Logi Options+, and the Ask ChatGPT multi-action (copy, open ChatGPT, paste after a prompt).</summary>
+internal static class StockKeys
+{
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern void keybd_event(byte key, byte scan, uint flags, UIntPtr extra);
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern uint SendInput(uint count, Input[] inputs, int size);
+
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    private struct KeyboardInput
+    {
+        public ushort Key;
+        public ushort Scan;
+        public uint Flags;
+        public uint Time;
+        public IntPtr Extra;
+    }
+
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Explicit, Size = 40)]
+    private struct Input
+    {
+        [System.Runtime.InteropServices.FieldOffset(0)] public uint Type;
+        [System.Runtime.InteropServices.FieldOffset(8)] public KeyboardInput Keyboard;
+    }
+
+    private const uint KeyUp = 0x0002, Unicode = 0x0004;
+    private const byte Win = 0x5B, Shift = 0x10, Control = 0x11, Enter = 0x0D;
+    private const string ChatGptPrompt = "Please write a draft reply to the prompt below:";
+
+    private static void Press(params byte[] keys)
+    {
+        foreach (var key in keys)
+        {
+            keybd_event(key, 0, 0, UIntPtr.Zero);
+        }
+        for (int index = keys.Length - 1; index >= 0; --index)
+        {
+            keybd_event(keys[index], 0, KeyUp, UIntPtr.Zero);
+        }
+    }
+
+    private static void Type(string text)
+    {
+        var inputs = new Input[text.Length * 2];
+        for (int index = 0; index < text.Length; ++index)
+        {
+            for (int part = 0; part < 2; ++part)
+            {
+                inputs[2 * index + part].Type = 1;
+                inputs[2 * index + part].Keyboard.Scan = text[index];
+                inputs[2 * index + part].Keyboard.Flags = Unicode | (part == 1 ? KeyUp : 0);
+            }
+        }
+        SendInput((uint)inputs.Length, inputs, System.Runtime.InteropServices.Marshal.SizeOf<Input>());
+    }
+
+    private static void Launch(string file, string? folder = null)
+    {
+        using var process = Process.Start(new ProcessStartInfo(file) {
+            UseShellExecute = true,
+            WorkingDirectory = folder ?? "",
+        });
+    }
+
+    internal static void Run(string key)
+    {
+        switch (key)
+        {
+            case "media_next": Press(0xB0); break;
+            case "media_playpause": Press(0xB3); break;
+            case "volume_mute": Press(0xAD); break;
+            case "emoji": Press(Win, 0xBE); break;
+            case "screenshot": Press(Win, Shift, 0x53); break;
+            case "explorer": Launch("explorer.exe"); break;
+            case "optionsplus":
+                string folder = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
+                    "LogiOptionsPlus");
+                Launch(Path.Combine(folder, "logioptionsplus.exe"), folder);
+                break;
+            case "ask_chatgpt":
+                ThreadPool.QueueUserWorkItem(_ =>
+                {
+                    Press(Control, 0x43);
+                    Thread.Sleep(150);
+                    Launch("https://chatgpt.com");
+                    Thread.Sleep(1500);
+                    Type(ChatGptPrompt);
+                    Press(Shift, Enter);
+                    Press(Control, 0x56);
+                    Press(Enter);
+                });
+                break;
+        }
     }
 }

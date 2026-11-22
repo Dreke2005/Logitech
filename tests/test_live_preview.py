@@ -1,5 +1,6 @@
 """Exercise the live RGB lip-reading entry point without capturing a webcam."""
 
+import hermetic  # noqa: F401
 import queue
 import sys
 import unittest

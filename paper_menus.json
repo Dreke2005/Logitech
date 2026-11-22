@@ -1,4 +1,15 @@
 {
+  "start": [
+    ["webcam", "Start the webcam and recording, then choose an app"],
+    ["media_next", "Next track"],
+    ["media_playpause", "Play or pause"],
+    ["volume_mute", "Mute"],
+    ["optionsplus", "Logi Options+"],
+    ["emoji", "Emoji"],
+    ["ask_chatgpt", "Ask ChatGPT about the selected text"],
+    ["screenshot", "Screenshot"],
+    ["explorer", "File Explorer"]
+  ],
   "home": [
     ["vscode", "VS Code"],
     ["matlab", "MATLAB"],
@@ -6,8 +17,8 @@
     ["chatgpt", "ChatGPT"],
     ["kicad", "KiCad"],
     ["ltspice", "LTspice"],
-    ["git", "Version control"],
-    ["plan", "Plan"]
+    ["plan", "Plan"],
+    ["start", "Stop the webcam and show the start page", "back"]
   ],
   "vscode": [
     ["camera", "Toggle camera"],
@@ -17,7 +28,7 @@
     ["graph", "Plot"],
     ["copy", "Copy"],
     ["paste", "Paste"],
-    ["open", "Open in VS Code"],
+    ["git", "Version control for this project", "version_control"],
     ["home", "Apps"]
   ],
   "vscode_languages": [
@@ -36,7 +47,7 @@
     ["copy", "Copy"],
     ["paste", "Paste"],
     ["open", "Open in MATLAB"],
-    ["save", "Save"],
+    ["git", "Version control for this project", "version_control"],
     ["home", "Apps"]
   ],
   "latex": [
@@ -46,19 +57,19 @@
     ["project", "Create report", "report"],
     ["copy", "Copy"],
     ["paste", "Paste into LaTeX project"],
-    ["browse", "Select and open LaTeX project", "browse"],
     ["overleaf", "Open in Overleaf"],
+    ["git", "Version control for this project", "version_control"],
     ["home", "Apps"]
   ],
   "chatgpt": [
     ["camera", "Toggle camera"],
     ["brief", "Draft a brief"],
+    ["flow", "Flowchart to Mermaid", "flow"],
     ["copy", "Copy"],
     ["paste", "Paste into brief"],
     ["chat", "Open ChatGPT"],
-    ["flow", "Flowchart to Mermaid", "flow"],
-    ["photo", "Open photo"],
-    ["save_photo", "Save photo"],
+    ["image", "Generate an image in ChatGPT from the drawing", "image"],
+    ["git", "Version control for this project", "version_control"],
     ["home", "Apps"]
   ],
   "kicad": [
@@ -69,6 +80,7 @@
     ["open", "Open in KiCad"],
     ["save", "Save"],
     ["photo", "Open photo"],
+    ["git", "Version control for this project", "version_control"],
     ["home", "Apps"]
   ],
   "ltspice": [
@@ -79,19 +91,19 @@
     ["paste", "Paste netlist"],
     ["open", "Open in LTspice"],
     ["save", "Save"],
-    ["photo", "Open photo"],
+    ["git", "Version control for this project", "version_control"],
     ["home", "Apps"]
   ],
   "git": [
     ["camera", "Toggle camera"],
-    ["commit", "Commit: type the message in a terminal", "git_commit"],
+    ["commit", "Commit: stage and type the message in a terminal", "git_commit"],
     ["push", "Push", "git_push"],
     ["pull", "Pull", "git_pull"],
     ["branch", "Create branch from writing", "git_branch"],
     ["diagram", "Run a drawn branch diagram", "git_diagram"],
-    ["remote", "GitHub or GitLab actions", "language"],
-    ["browse", "Pick another repository", "git_repo"],
-    ["home", "Apps"]
+    ["remote", "GitHub or GitLab actions", "remote_host"],
+    ["browse", "Pick another project folder", "git_repo"],
+    ["back", "Back to the app"]
   ],
   "git_remote": [
     ["camera", "Toggle camera"],
@@ -111,6 +123,7 @@
     ["paste", "Paste"],
     ["open", "Open in VS Code"],
     ["save", "Save"],
+    ["git", "Version control for this project", "version_control"],
     ["home", "Apps"]
   ]
 }

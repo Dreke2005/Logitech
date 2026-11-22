@@ -1,5 +1,6 @@
 """Verify Windows event encoding without sending keyboard or mouse input."""
 
+import hermetic  # noqa: F401
 import ctypes
 import sys
 import unittest

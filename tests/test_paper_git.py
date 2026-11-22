@@ -1,3 +1,4 @@
+import hermetic  # noqa: F401
 import os
 import shutil
 import stat
@@ -193,6 +194,57 @@ class WorkbenchGitTests(GitTestCase):
         self.assertIn("empty commit", bench.statuses[-1])
         self.assertIn("no remote", bench.statuses[-1])
         self.assertEqual(self.log(repo, "main")[0], "Merge docs into main")
+
+    def test_auto_recording_commits_written_text_on_the_current_branch(self):
+        import queue
+        from functools import partial
+
+        import paper_workbench
+
+        repo = self.make_repo()
+        bench = self.workbench(repo)
+        bench.results = queue.SimpleQueue()
+        bench.show_draft = lambda draft: None
+        bench._git_diagram = partial(paper_workbench.PaperWorkbench._git_diagram, bench)
+        bench.run_git_diagram = partial(paper_workbench.PaperWorkbench.run_git_diagram, bench)
+        (repo / "login.py").write_text("x = 1\n", encoding="utf-8")
+        reading = 'commit "Add login form"'
+        paper_workbench.PaperWorkbench.finish_git(bench, Draft(reading, reading, (), ".txt"), "git_auto")
+        draft, _, workflow = bench.results.get(timeout=60)
+        paper_workbench.PaperWorkbench.finish_git(bench, draft, workflow)
+        self.assertEqual(self.log(repo)[0], "Add login form")
+        self.assertIn("Git diagram done", bench.statuses[-1])
+
+    def test_version_control_page_records_without_a_key(self):
+        import paper_workbench
+
+        started = []
+        bench = SimpleNamespace(menu="git", camera=object(), busy=False, dialog_open=False, writing_workflow=None,
+                                git_repo=Path("repo"), page_pinned=False, roi=None, quiet=False,
+                                active_key=None, key_result=None, statuses=[])
+        bench.status = SimpleNamespace(set=bench.statuses.append, get=lambda: "Pushed repo to origin/main.")
+
+        def record(workflow):
+            started.append(workflow)
+            bench.writing_workflow = workflow
+            bench.statuses.append("Recording for a branch diagram or a commit message.")
+
+        bench.writing_action = record
+        paper_workbench.PaperWorkbench.arm_git_auto(bench, first=True)
+        self.assertEqual(started, ["git_auto"])
+        self.assertIn("draw branches", bench.statuses[-1])
+        self.assertEqual(bench.active_key, ("git", "diagram"))
+        # Re-armed after a run: the result of that run stays in the status line.
+        bench.writing_workflow = None
+        paper_workbench.PaperWorkbench.arm_git_auto(bench)
+        self.assertEqual(bench.statuses[-1], "Pushed repo to origin/main.")
+        self.assertFalse(bench.quiet)
+        # Never while another recording runs, the camera is off, or on another page.
+        for change in ({"writing_workflow": "git_branch"}, {"camera": None}, {"menu": "vscode"}, {"busy": True}):
+            started.clear()
+            probe = SimpleNamespace(**{**vars(bench), "writing_workflow": None, **change})
+            paper_workbench.PaperWorkbench.arm_git_auto(probe)
+            self.assertEqual(started, [], change)
 
     def test_paste_todo_commits_todo_file_and_text_becomes_commit_message(self):
         from functools import partial

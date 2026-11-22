@@ -87,3 +87,45 @@ def current_folder(app, saved=None, report_folder=None):
     if app == "vscode":
         return vscode_project() or own
     return own or vscode_project()
+
+
+# Process names of the apps that have a keypad page.
+APP_PROCESSES = {"code.exe": "vscode", "matlab.exe": "matlab", "ltspice.exe": "ltspice", "chatgpt.exe": "chatgpt",
+                 "kicad.exe": "kicad", "eeschema.exe": "kicad", "pcbnew.exe": "kicad", "texstudio.exe": "latex",
+                 "texworks.exe": "latex", "texmaker.exe": "latex", "miktex-texworks.exe": "latex"}
+BROWSERS = ("chrome.exe", "msedge.exe", "firefox.exe", "brave.exe")
+
+
+def app_for_window(process, title):
+    """The keypad page for a foreground window, or None when the window belongs to no PaperBridge app."""
+    process, title = process.lower(), title or ""
+    if process in BROWSERS:
+        return "latex" if "overleaf" in title.lower() else "chatgpt" if "chatgpt" in title.lower() else None
+    app = APP_PROCESSES.get(process)
+    if app == "vscode" and title.split(" - ")[0].strip().lstrip("● ").lower().endswith((".tex", ".bib")):
+        return "latex"  # A LaTeX file open in VS Code is LaTeX work.
+    return app
+
+
+def foreground_app():
+    """The keypad page of the application the user has in front right now, or None."""
+    if os.name != "nt":
+        return None
+    user32, kernel32 = ctypes.windll.user32, ctypes.windll.kernel32
+    window = user32.GetForegroundWindow()
+    if not window:
+        return None
+    pid = ctypes.c_ulong()
+    user32.GetWindowThreadProcessId(window, ctypes.byref(pid))
+    handle = kernel32.OpenProcess(0x1000, False, pid.value)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not handle:
+        return None
+    try:
+        buffer, size = ctypes.create_unicode_buffer(1024), ctypes.c_ulong(1024)
+        if not kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
+            return None
+    finally:
+        kernel32.CloseHandle(handle)
+    title = ctypes.create_unicode_buffer(512)
+    user32.GetWindowTextW(window, title, 512)
+    return app_for_window(Path(buffer.value).name, title.value)

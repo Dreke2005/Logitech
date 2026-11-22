@@ -1,3 +1,4 @@
+import hermetic  # noqa: F401
 import unittest
 from unittest.mock import Mock, call
 

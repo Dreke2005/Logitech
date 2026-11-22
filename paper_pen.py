@@ -6,6 +6,438 @@ import cv2
 import numpy as np
 
 
+@dataclass(frozen=True)
+class PenEnd:
+    point: tuple  # The nib, in frame pixels.
+    back: tuple  # The other end of the visible barrel.
+    width: float  # Barrel width in pixels.
+    colour: tuple = None  # Median hue, saturation, value of the barrel.
+    held: bool = False  # True when a detected hand's thumb and index are at the barrel.
+    coloured: bool = True  # Found by its colour (not as a dark shape): only then is its colour worth learning.
+    tapered: bool = False  # The body was followed to its tapering point: the landmark is on the nib itself.
+    cone: float = 0.0  # From the end of the barrel's colour to the point, in pixels, as last measured.
+
+
+def hue_distance(first, second):
+    """Distance between two OpenCV hues (0-180), around the circle: red is both 1 and 178."""
+    difference = abs(float(first) - float(second)) % 180.0
+    return min(difference, 180.0 - difference)
+
+
+def blend_colour(known, seen, share=0.1):
+    """(hue, saturation, value) moved a share of the way from ``known`` to ``seen``, the hue around its circle."""
+    step = (float(seen[0]) - float(known[0]) + 90.0) % 180.0 - 90.0
+    hue = (float(known[0]) + share * step) % 180.0
+    return (hue,) + tuple((1 - share) * float(a) + share * float(b) for a, b in zip(known[1:], seen[1:]))
+
+
+def _line(points):
+    """Centre, unit axis, extent along the axis, and width of a bar of pixels.
+
+    The width is taken from the middle of the bar (four times the median distance from its line) and the
+    line is fitted again without what sticks out sideways: a finger's shadow hanging on to a barrel must
+    neither turn it nor make it look too wide to be a pen."""
+    kept = points
+    for _ in range(2):
+        centre = kept.mean(axis=0)
+        offset = kept - centre
+        _, vectors = np.linalg.eigh(offset.T @ offset)
+        axis = vectors[:, 1].astype(np.float32)
+        across = (points - centre) @ np.array((-axis[1], axis[0]), np.float32)
+        width = 4.0 * float(np.median(np.abs(across)))
+        inside = np.abs(across) <= 0.5 * width + 1
+        if inside.all():
+            break
+        kept = points[inside]
+    along = (kept - centre) @ axis
+    return centre, axis, float(along.min()), float(along.max()), width
+
+
+def _barrels(mask, hue, saturation, paper_like, ink_width, widest, shortest, reach):
+    """Bars in a 0/1 mask that can be a pen's barrel, each as (pixels, centre, axis, low, high, thickness).
+
+    The fingers hold a pen across its barrel, so the camera sees two or three pieces in a row: the long
+    back, sometimes a bit between the fingers, and the short front before the point. A piece that lies
+    on the line of a bar, is as narrow as the bar, has its colour, and is separated from it by something
+    other than plain paper (the fingers) belongs to the same pen. Without this the longest piece alone
+    would be taken for the pen and its end at the fingers for the nib."""
+    # A glossy barrel has a white highlight along it that would split it into two thin bars: close it first.
+    solid = cv2.morphologyEx(mask.astype(np.uint8), cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+    solid = cv2.morphologyEx(solid, cv2.MORPH_OPEN, np.ones((ink_width + 2,) * 2, np.uint8))
+    count, labels, stats, centroids = cv2.connectedComponentsWithStats(solid, connectivity=8)
+    if count <= 1:
+        return []
+    largest = 0.02 * solid.size
+    usable = [label for label in range(1, count) if 6 <= stats[label, cv2.CC_STAT_AREA] <= largest]
+    pieces = {}
+
+    def pixels(label):
+        if label not in pieces:
+            x, y, w, h = stats[label, :4]
+            ys, xs = np.nonzero(labels[y:y + h, x:x + w] == label)
+            pieces[label] = np.c_[xs + x, ys + y].astype(np.float32)
+        return pieces[label]
+
+    seeds = []
+    for label in usable:
+        x, y, w, h, area = stats[label]
+        if max(w, h) < 0.7 * shortest or area < 30:
+            continue
+        centre, axis, low, high, thickness = _line(pixels(label))
+        length = high - low
+        if length >= shortest and length >= 3.5 * thickness and ink_width + 1.5 <= thickness <= widest:
+            seeds.append((length, label, centre, axis, low, high, thickness))
+    seeds.sort(key=lambda item: -item[0])
+    centres = centroids[usable].astype(np.float32)
+    usable = np.asarray(usable)
+    rows, cols = mask.shape
+    found, taken = [], set()
+    for length, label, centre, axis, low, high, thickness in seeds[:6]:
+        if label in taken:
+            continue
+        members, points = {label}, pixels(label)
+        tone = float(np.median(hue[points[:, 1].astype(int), points[:, 0].astype(int)])) if hue is not None else None
+        for _ in range(4):
+            normal = np.array((-axis[1], axis[0]), np.float32)
+            offset = centres - centre
+            ahead = np.maximum(np.maximum(offset @ axis - high, low - offset @ axis), 0)
+            # A short or ragged piece gives its own direction only roughly: allow a quarter of the distance.
+            near = (np.abs(offset @ normal) <= 0.5 * thickness + 2 + 0.25 * ahead) & (ahead <= reach + 4)
+            added = False
+            for other in usable[near]:
+                other = int(other)
+                if other in members or other in taken:
+                    continue
+                piece = pixels(other)
+                if tone is not None:
+                    other_tone = float(np.median(hue[piece[:, 1].astype(int), piece[:, 0].astype(int)]))
+                    if hue_distance(tone, other_tone) > 14:
+                        continue
+                # One straight bar through both: every pixel of the two within the barrel's width of one line.
+                joined = np.vstack([points, piece])
+                joint_centre, joint_axis, joint_low, joint_high, _ = _line(joined)
+                joint_normal = np.array((-joint_axis[1], joint_axis[0]), np.float32)
+                # (A finger's red shadow often hangs on to a piece, so its middle counts, not its widest part.)
+                if any(abs(float(np.mean(part))) > 0.25 * thickness + 1.5
+                       or float(np.median(np.abs(part))) > 0.5 * thickness + 1
+                       for part in ((points - joint_centre) @ joint_normal, (piece - joint_centre) @ joint_normal)):
+                    continue
+                first, second = (points - joint_centre) @ joint_axis, (piece - joint_centre) @ joint_axis
+                gap = max(float(second.min() - first.max()), float(first.min() - second.max()))
+                if gap > reach:
+                    continue
+                if gap > 2:
+                    start = float(first.max()) if second.min() > first.max() else float(second.max())
+                    steps = joint_centre + np.outer(np.arange(start + 1, start + gap), joint_axis)
+                    xs = np.clip(np.rint(steps[:, 0]).astype(int), 0, cols - 1)
+                    ys = np.clip(np.rint(steps[:, 1]).astype(int), 0, rows - 1)
+                    if paper_like[ys, xs].mean() > 0.35:
+                        continue  # Plain paper between them: two things in a row, not one pen under a finger.
+                members.add(other)
+                points = joined
+                if joint_axis @ axis < 0:
+                    joint_axis, joint_low, joint_high = -joint_axis, -joint_high, -joint_low
+                centre, axis, low, high = joint_centre, joint_axis, joint_low, joint_high
+                added = True
+                break
+            if not added:
+                break
+        taken |= members
+        found.append((points, centre, axis, low, high, thickness))
+    return found
+
+
+def _probe(frame, end, direction, width, cone_length=0.0):
+    """Follow the pen's body from a barrel end outward to where it stops.
+
+    A strip of the frame along the pen is cut out, straightened. Row by row the body's cross-section
+    (anything coloured or much darker than the paper) is followed from the barrel. A pencil's cone and
+    graphite or a ballpoint's cone and metal tip narrow steadily to a point lying on paper; the back end
+    stops bluntly (an eraser, a cap), disappears into the hand or a sleeve, or leaves the picture. Fingers
+    lying across the pen are crossed: beyond them the body is as narrow as before and goes on to its point.
+    ``cone_length`` is how long this pen's cone was when last seen whole (0: unknown).
+    Returns (tip, kind, measured barrel width, cone) with kind "point", "blunt", "open" (ended on paper, neither
+    clearly), "ink" (ended on dark writing), "hand" (went under something wide and did not come out), or
+    "edge" (left the picture); cone is the length from where the barrel starts to narrow to the point when
+    the point was followed over plain paper to its end, else 0."""
+    height, frame_width = frame.shape[:2]
+    end = np.asarray(end, np.float32)
+    direction = np.asarray(direction, np.float32)
+    direction = direction / max(float(np.linalg.norm(direction)), 1e-6)
+    normal = np.array((-direction[1], direction[0]), np.float32)
+    half = int(max(8, round(1.6 * width)))
+    behind = int(max(6, round(1.5 * width)))
+    ahead = int(round(11 * width + 40))
+    along = np.arange(-behind, ahead + 1, dtype=np.float32)
+    across = np.arange(-half, half + 1, dtype=np.float32)
+    xs = end[0] + along[:, None] * direction[0] + across[None, :] * normal[0]
+    ys = end[1] + along[:, None] * direction[1] + across[None, :] * normal[1]
+    strip = cv2.remap(frame, xs, ys, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+    outside = (xs < 0) | (xs > frame_width - 1) | (ys < 0) | (ys > height - 1)
+    saturation = cv2.cvtColor(strip, cv2.COLOR_BGR2HSV)[:, :, 1]
+    gray = cv2.cvtColor(strip, cv2.COLOR_BGR2GRAY)
+    plain = (saturation <= 45) & ~outside
+    if np.count_nonzero(plain) >= 30:
+        paper, tint = float(np.percentile(gray[plain], 80)), float(np.median(saturation[plain]))
+    else:
+        paper, tint = float(np.percentile(gray, 90)), 15.0
+    body = ((saturation > tint + 28) | (gray < 0.62 * paper)).astype(np.uint8)
+    # A glossy barrel has a white highlight along it, which must not split the cross-section in two.
+    bridge = max(3, int(round(0.45 * width))) | 1
+    body = cv2.morphologyEx(body, cv2.MORPH_CLOSE, np.ones((1, bridge), np.uint8))
+
+    def run(row, centre):
+        edges = np.flatnonzero(np.diff(np.r_[0, body[row].astype(np.int8), 0]))
+        best = None
+        for start, stop in zip(edges[::2], edges[1::2]):
+            distance = 0.0 if start - 1.5 <= centre <= stop + 0.5 else min(abs(start - centre), abs(stop - 1 - centre))
+            if best is None or distance < best[0]:
+                best = distance, start, stop
+        return best
+
+    barrel = []
+    for row in range(behind):
+        found = run(row, half)
+        if found is not None and found[0] == 0 and found[1] > 0 and found[2] < len(across):
+            barrel.append(found[2] - found[1])
+    # Fingers beside the barrel widen its cross-section: the narrower rows show the barrel alone, and the
+    # measurement only adjusts the given width.
+    measured = float(np.clip(np.percentile(barrel, 25), 0.6 * width, 1.1 * width)) if barrel else float(width)
+    centre, misses, covered, kind, leaving = float(half), 0, 0, None, 0.0
+    steps, widths, middles = [], [], []
+    for row in range(behind, len(along)):
+        if outside[row, half]:
+            kind = "edge"
+            break
+        found = run(row, centre)
+        if found is None or found[0] > 2:
+            misses += 1
+            if misses >= 3:
+                break
+            continue
+        _, start, stop = found
+        if stop - start > 1.4 * measured + 2 or start == 0 or stop == len(across):
+            covered += 1
+            misses = 0
+            leaving = float(along[row])
+            continue
+        if covered >= 3:
+            steps, widths, middles = [], [], []  # Out from under the fingers: the front of the pen starts here.
+        misses = covered = 0
+        middle = (start + stop - 1) / 2
+        centre += float(np.clip(middle - centre, -1.5, 1.5))
+        steps.append(float(along[row]))
+        widths.append(float(stop - start))
+        middles.append(middle - half)
+    if kind is None and covered >= 3:
+        # Under the fingers and not out again: the point is hidden, at best where the hand ends on this line.
+        tip = end + direction * leaving
+        return (float(tip[0]), float(tip[1])), "hand", measured, 0.0
+    if not steps:
+        return tuple(float(v) for v in end), kind or "blunt", measured, 0.0
+    steps, widths, middles = np.asarray(steps), np.asarray(widths), np.asarray(middles)
+    narrow = np.flatnonzero(widths < 0.8 * measured)  # The cone starts where the barrel first narrows.
+    taper_start = float(steps[max(narrow[0] - 1, 0)]) if len(narrow) else float(steps[-1])
+    # Past the barrel a pen only gets narrower. Where the cross-section widens again, the nib lies on
+    # something dark (writing it points at, a printed line), which is not part of the pen: those rows are
+    # left out, and what the walk found beyond them is trusted less than the cone's own shape.
+    grown = (widths > np.minimum.accumulate(widths) + 2.5) & (steps > taper_start)
+    on_ink = bool(grown.any()) and kind is None
+    if on_ink:
+        steps, widths, middles = steps[~grown], widths[~grown], middles[~grown]
+    last = float(steps[-1])
+    taper = last - taper_start
+    reach, offset, seen = last, float(middles[-1]), 0.0
+    if kind is None:
+        kind = "blunt" if taper < 0.35 * measured else "open"
+        cone = (steps >= taper_start) & (widths >= 0.25 * measured) & (widths <= 0.85 * measured)
+        fitted = False
+        if np.count_nonzero(cone) >= 4:
+            slope, intercept = np.polyfit(steps[cone], widths[cone], 1)
+            # Writing that touches the cone's side widens single rows: fit again without those.
+            clean = cone & (widths - (slope * steps + intercept) <= 1.5)
+            if 4 <= np.count_nonzero(clean) < np.count_nonzero(cone):
+                cone = clean
+                slope, intercept = np.polyfit(steps[cone], widths[cone], 1)
+            fitted = slope < -0.08
+        if fitted:
+            # The cone's edges meet just past the point (a point is a little blunt, about a fifth of the
+            # barrel wide): ink or a shadow under the nib cannot move it.
+            apex = -intercept / slope
+            blunt = apex + 0.18 * measured / slope
+            reach = float(min(last, blunt) if on_ink else min(max(last, apex - 0.45 * taper), blunt))
+        if on_ink and cone_length > 0 and len(narrow):
+            # The point rests on dark writing (it points at it), which hides its outline. Where the barrel
+            # starts to narrow is still seen, and the point lies as far from there as it always does.
+            reach = taper_start + cone_length
+        if (fitted or (on_ink and cone_length > 0)) and reach - taper_start >= 0.7 * measured:
+            kind = "point"
+            seen = 0.0 if on_ink else reach - taper_start
+        elif on_ink:
+            kind = "ink"
+        if fitted:
+            lean, level = np.polyfit(steps[cone], middles[cone], 1)
+            offset = float(lean * reach + level)
+    tip = end + direction * reach + normal * offset
+    return (float(tip[0]), float(tip[1])), kind, measured, float(seen)
+
+
+def _pen_masks(frame, region, scale):
+    """The part of the frame to search, at ``scale``, with what a barrel is told by: its HSV channels,
+    the skin-coloured pixels, plain paper, and the coloured and the black pixels a barrel can be made of."""
+    height, width = frame.shape[:2]
+    x0, y0, x1, y1 = region or (0, 0, width, height)
+    x0, y0, x1, y1 = max(0, int(x0)), max(0, int(y0)), min(width, int(x1)), min(height, int(y1))
+    if x1 - x0 < 40 or y1 - y0 < 40:
+        return None
+    patch = cv2.resize(frame[y0:y1, x0:x1], None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+    hue, saturation, value = cv2.split(cv2.cvtColor(patch, cv2.COLOR_BGR2HSV))
+    skin = ((hue <= 25) | (hue >= 165)) & (saturation >= 30) & (saturation <= 180) & (value >= 60)
+    coloured = (saturation >= 90) & (value >= 45) & ~skin
+    black = value < 60
+    paper_like = (saturation <= 45) & (value >= float(np.percentile(value[::4, ::4], 90)) - 40)
+    return np.array((x0, y0), np.float32), hue, saturation, value, skin, coloured, black, paper_like
+
+
+INK_WIDTH = 2  # Ink strokes are about this wide at half scale; a barrel is much thicker.
+
+
+def find_bars(frame, region=None, scale=0.5):
+    """Both ends of every bar in the frame that looks like a pen's barrel, held or not: [(end, end)].
+
+    Called on the frame from before the writing, it lists what must not be taken for the pen later: a
+    cable, a ruler, a pen left lying on the desk (``find_pen(ignore=...)``)."""
+    masks = _pen_masks(frame, region, scale)
+    if masks is None:
+        return []
+    origin, hue, saturation, value, skin, coloured, black, paper_like = masks
+    widest = 0.018 * frame.shape[1] * scale
+    bars = []
+    for mask in (coloured, black):
+        for points, centre, axis, low, high, thickness in _barrels(
+                mask, hue if mask is coloured else None, saturation, paper_like, INK_WIDTH, widest,
+                22 * scale * 2, 140 * scale):
+            ends = (centre + np.outer((low, high), axis)) / scale + origin
+            bars.append((ends[0], ends[1]))
+    return bars
+
+
+def find_pen(frame, region=None, hands=(), scale=0.5, colour=None, previous=None, ignore=(), inside=None):
+    """The pen in the frame, found by its barrel: an elongated, coloured (or black), non-skin shape.
+
+    The hand model often misses a hand reaching in from the far side of the desk, and its landmarks
+    only give the fingers, not the nib. The barrel itself is easy to see: a saturated or very dark bar,
+    several times longer than wide and thicker than ink, crossed by the fingers that hold it
+    (``_barrels``). Each end of it is then followed outward (``_probe``): the nib is the end that tapers
+    to a point on the paper, on the short side of the grip, away from the wrist, and where it was in
+    ``previous`` (the PenEnd of the frame before). ``ignore`` lists the ends of bars that lay in the
+    picture before anyone held a pen (``find_bars``): a bar still lying exactly there is not the pen.
+    ``inside`` is a box (x0, y0, x1, y1) one end of the pen must be in: the sheet being written on.
+    Returns a PenEnd, or None.
+    """
+    width = frame.shape[1]
+    masks = _pen_masks(frame, region, scale)
+    if masks is None:
+        return None
+    origin, hue, saturation, value, skin, coloured, black, paper_like = masks
+    ink_width = INK_WIDTH
+    widest = 0.018 * width * scale  # A barrel is narrower than a wrapper or a phone edge.
+    near_skin = cv2.dilate(skin.astype(np.uint8), np.ones((9, 9), np.uint8)) != 0  # Next to the hand holding it.
+    grips = [np.mean([hand["fingertips"][name]["pixel"] for name in ("thumb", "index")], axis=0)
+             for hand in hands or () if hand.get("fingertips") and "thumb" in hand["fingertips"]
+             and "index" in hand["fingertips"]]
+    wrists = [np.asarray(hand["landmarks"][0]["pixel"], float) for hand in hands or () if hand.get("landmarks")]
+    candidates = []
+    for mask, weight in ((coloured, 1.0), (black, 0.7)):
+        if mask is black and candidates:
+            break  # A coloured barrel is far more reliable than a dark shape.
+        for points, centre, axis, low, high, thickness in _barrels(
+                mask, hue if mask is coloured else None, saturation, paper_like, ink_width, widest,
+                22 * scale * 2, 140 * scale):
+            ys, xs = points[:, 1].astype(int), points[:, 0].astype(int)
+            if near_skin[ys, xs].mean() < 0.03:
+                continue
+            length = high - low
+            ends = (centre + np.outer((low, high), axis)) / scale + origin
+            if inside is not None and not any(inside[0] <= x < inside[2] and inside[1] <= y < inside[3]
+                                              for x, y in ends):
+                continue
+            if any(min(max(np.linalg.norm(ends[0] - a), np.linalg.norm(ends[1] - b)),
+                       max(np.linalg.norm(ends[0] - b), np.linalg.norm(ends[1] - a))) <= 8 for a, b in ignore):
+                continue  # Lying where it lay before the recording: a cable, a ruler, a pen put down.
+            score = weight * min(length / (60 * scale * 2), 2.0)
+            shade = (float(np.median(hue[ys, xs])), float(np.median(saturation[ys, xs])), float(np.median(value[ys, xs])))
+            reds = hue[ys, xs]
+            if np.count_nonzero(reds < 12) and np.count_nonzero(reds > 168):
+                # Red lies on both ends of the hue scale; the median of the two halves would be no colour at all.
+                turned = (reds.astype(np.float32) + 90) % 180
+                shade = ((float(np.median(turned)) - 90) % 180,) + shade[1:]
+            match = 1.0
+            if colour is not None:
+                # The pen seen before: a cable or a marker of another colour is not it.
+                difference = np.array((hue_distance(shade[0], colour[0]), shade[1] - colour[1],
+                                       shade[2] - colour[2])) / (12.0, 45.0, 55.0)
+                match = float(np.exp(-0.5 * np.sum(difference ** 2)))
+            held = False
+            if grips:
+                # The barrel the writing hand holds: close to its thumb and index tips.
+                near = min(float(np.min(np.linalg.norm(ends - grip, axis=1))) for grip in grips)
+                held = near < 0.6 * length / scale
+                score *= 1.5 if held else 0.6
+            if previous is not None:
+                # The pen of the frame before moves on a little; it does not jump to another bar.
+                reach = 0.5 * length / scale + 60
+                if min(np.linalg.norm(ends - np.asarray(previous.point, float), axis=1).min(),
+                       np.linalg.norm(ends - np.asarray(previous.back, float), axis=1).min()) < reach:
+                    score *= 1.4
+            # Skin along the barrel: where the fingers hold it, as a share of its length from the low end.
+            steps = centre + np.outer(np.arange(low, high + 1), axis)
+            sx = np.clip(np.rint(steps[:, 0]).astype(int), 0, skin.shape[1] - 1)
+            sy = np.clip(np.rint(steps[:, 1]).astype(int), 0, skin.shape[0] - 1)
+            covered = np.flatnonzero(skin[sy, sx])
+            grip_at = float(np.median(covered)) / max(len(steps) - 1, 1) if len(covered) >= 3 else None
+            around = []
+            reach = max(6, int(0.35 * length))
+            for x, y in (centre + np.outer((low, high), axis)).astype(int):
+                around.append(int(skin[max(0, y - reach):y + reach + 1, max(0, x - reach):x + reach + 1].sum()))
+            candidates.append((score, match, ends, thickness / scale, shade, held, mask is coloured, grip_at, around))
+    if not candidates:
+        return None
+    # With a known colour, only shapes of that colour count when there is one. When none matches (another
+    # pen, or a colour learned wrongly), the colour is ignored rather than losing the pen altogether.
+    matching = [item for item in candidates if item[1] >= 0.45]
+    pool = [(item[0] * item[1],) + item[1:] for item in matching] if matching else candidates
+    score, _, ends, thickness, shade, held, is_coloured, grip_at, around = max(pool, key=lambda item: item[0])
+    outward = (ends[0] - ends[1]) / max(float(np.linalg.norm(ends[0] - ends[1])), 1.0)
+    known = previous.cone if previous is not None else 0.0
+    probes = [_probe(frame, ends[0], outward, thickness, known), _probe(frame, ends[1], -outward, thickness, known)]
+    votes = []
+    for index, (tip, kind, _, _) in enumerate(probes):
+        vote = {"point": 1.2, "blunt": -0.6, "edge": -1.0}.get(kind, 0.0)
+        if grip_at is not None:
+            # The fingers hold a pen near its point: the nib is the end on the short side of the grip.
+            share = grip_at if index == 0 else 1 - grip_at
+            vote += 0.6 if share < 0.45 else (-0.6 if share > 0.55 else 0.0)
+        elif around[index] < around[1 - index] and probes[1 - index][1] != "blunt":
+            vote += 0.3  # Less skin around it: the other end is in the hand.
+        if wrists and held:
+            wrist = min(wrists, key=lambda point: float(np.min(np.linalg.norm(ends - point, axis=1))))
+            if np.linalg.norm(ends[index] - wrist) > np.linalg.norm(ends[1 - index] - wrist):
+                vote += 0.5
+        if previous is not None:
+            before = np.subtract(previous.point, previous.back)
+            if before @ (ends[index] - ends[1 - index]) > 0:
+                vote += 0.5
+        votes.append(vote)
+    nib = int(np.argmax(votes))
+    tip, kind, measured, seen = probes[nib]
+    back = ends[1 - nib]
+    # The cone's length as seen whole on plain paper, steadied over the frames (see _probe).
+    cone = known if seen <= 0 else (seen if known <= 0 else 0.7 * known + 0.3 * seen)
+    return PenEnd(tuple(int(round(v)) for v in tip), tuple(int(round(v)) for v in back),
+                  float(max(thickness, 0.8 * measured)), shade, held, is_coloured, kind == "point", cone)
+
+
 def locate_pen(frame, grip, wrist, radius):
     """Find a narrow pen shaft aligned with the grip, then estimate its exposed endpoint."""
     height, width = frame.shape[:2]

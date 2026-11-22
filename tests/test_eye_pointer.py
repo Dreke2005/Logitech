@@ -1,5 +1,6 @@
 """Exercise calibration and eye gestures without opening a camera or the desktop."""
 
+import hermetic  # noqa: F401
 import unittest
 from types import SimpleNamespace
 

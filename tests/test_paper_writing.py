@@ -1,3 +1,4 @@
+import hermetic  # noqa: F401
 import unittest
 
 import cv2
@@ -187,7 +188,8 @@ class WritingSessionTests(unittest.TestCase):
         result = session.select(self.sheet, prefer_recent=True)
         self.assertIsNotNone(result)
         x0, y0, x1, y1 = result.page.bounds
-        self.assertLess(x1, 330)
+        # The writing the pen passed over, glyph by glyph, and not the blob at x 473..507 elsewhere on the sheet.
+        self.assertLess(x1, 400)
         self.assertGreater(y0, 190)
         np.testing.assert_array_equal(result.page.image, self.sheet[y0:y1, x0:x1])
 
@@ -456,9 +458,12 @@ class TightCropTests(unittest.TestCase):
             sample.down = False  # Tip tracking failed to confirm any stroke.
         selected = session.select(frame, prefer_recent=True)
         self.assertIsNotNone(selected)
-        self.assertEqual(selected.strokes, ())
         self.assert_tight(selected.page.bounds)
         self.assertIsNotNone(selected.evidence)
+        # The strokes are traced on the new ink itself, so they exist even without a confirmed pen-down sample.
+        ink = session._new_ink(frame)
+        points = np.vstack(selected.strokes)
+        self.assertTrue(ink[points[:, 1], points[:, 0]].all())
 
     def test_new_ink_map_keeps_thin_strokes_and_drops_blobs_and_old_ink(self):
         session, frame, page = self.record_with_clutter()

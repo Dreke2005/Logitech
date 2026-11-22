@@ -11,6 +11,8 @@ ROOT = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "LogiInsightPaper"
 STATE = ROOT / "state.json"
 COMMANDS = ROOT / "commands"
 MENUS = json.loads(Path(__file__).with_name("paper_menus.json").read_text(encoding="utf-8"))
+# The app pages, by key, with their names. The apps page also holds the key back to the start page.
+APPS = {button[0]: button[1] for button in MENUS["home"] if button[0] != "start"}
 
 
 def _write_json(path, value):
@@ -39,10 +41,10 @@ def send_slot(state, slot):
     _write_json(COMMANDS / name, {"session": state["session"], "revision": state["revision"], "slot": slot})
 
 
-def send_route(state, route):
+def send_route(state, route, menu="home"):
     COMMANDS.mkdir(parents=True, exist_ok=True)
     _write_json(COMMANDS / f"{time.time_ns()}-{uuid4().hex}.json",
-                {"session": state["session"], "menu": "home", "action": route})
+                {"session": state["session"], "menu": menu, "action": route})
 
 
 class KeypadSession:

@@ -124,9 +124,6 @@ public abstract class PaperAppFolder : PluginDynamicFolder
         return JsonSerializer.Deserialize<Dictionary<string, string[][]>>(stream)!;
     }
 
-    internal static string? HomeRoute(int slot) =>
-        Menus.TryGetValue("home", out var apps) && slot < apps.Length ? apps[slot][0] : null;
-
     internal static string[]? ButtonForSlot(string? menu, int slot) =>
         Menus.TryGetValue(menu ?? "home", out var buttons) && slot < buttons.Length ? buttons[slot] : null;
 }

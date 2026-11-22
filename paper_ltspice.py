@@ -113,23 +113,121 @@ def open_ltspice(path, run=False):
     subprocess.Popen([str(find_ltspice()), *(["-Run"] if run else []), str(path)])
 
 
+PROBLEM = re.compile(r"error|unknown|undefined|singular|fail|can't|cannot|missing|expected|over-defined|floating|"
+                     r"not found|unable|could not|convergence|time step too small|unrecognized|syntax", re.IGNORECASE)
+# What LTspice's messages mean on a drawn circuit, in the order they are looked for.
+EXPLANATIONS = (
+    (r"paralleled|over-defined", "Two voltage sources (or a source and a short) sit across the same two nets. Check "
+                                 "the net labels on the sources."),
+    (r"singular matrix", "The circuit cannot be solved: a node has no DC path to ground, or sources fight each other. "
+                         "Check the ground and the net labels."),
+    (r"node (\S+) is floating", "A net is connected to nothing else or has no path to ground. Check its label on the "
+                                "sketch."),
+    (r"undefined model|unknown (?:model|subcircuit)|could not find|not found", "A part's value is not something "
+     "LTspice knows. Write resistor, capacitor, and inductor values as numbers with a unit prefix (1k, 100n, 10m)."),
+    (r"expected device|unknown syntax|unrecognized|syntax|missing|unknown parameter", "A line of the netlist is "
+     "incomplete. Check the simulation command (for example .tran 10m) and that every part has a value."),
+    (r"time step too small|convergence", "The simulation did not converge. Try a shorter .tran time or add a small "
+                                         "series resistance."),
+)
+
+
+def _log_text(path):
+    raw = Path(path).read_bytes()
+    return raw.decode("utf-16-le" if raw[1:2] == b"\x00" else "utf-8", errors="replace")
+
+
+def read_results(path):
+    """What a finished run found, from the .raw file next to the schematic: the operating point as
+    'V(out) = 3.84 V' lines, or the range of every node voltage over a transient or sweep. [] when the
+    file is missing or in a layout this does not know."""
+    import struct
+
+    lines = []
+    for raw_path in (Path(path).with_suffix(".raw"), Path(path).with_suffix(".op.raw")):
+        try:
+            data = raw_path.read_bytes()
+        except OSError:
+            continue
+        marker = "Binary:\n".encode("utf-16-le")
+        split = data.find(marker)
+        if split < 0:
+            continue
+        header, body = data[:split].decode("utf-16-le", errors="replace"), data[split + len(marker):]
+        plot = re.search(r"Plotname:\s*(.+)", header)
+        count = re.search(r"No\. Points:\s*(\d+)", header)
+        names = re.findall(r"^\t\d+\t(\S+)\t\S+", header, flags=re.M)
+        if not plot or not count or not names or "complex" in header.split("Variables:")[0].lower():
+            if plot and count:
+                lines.append(f"{plot[1].strip()} finished with {int(count[1])} points.")
+            continue
+        points, variables = int(count[1]), len(names)
+        if len(body) == points * (8 + 4 * (variables - 1)):
+            layout = "<d" + "f" * (variables - 1)  # The first variable is a double, the others are floats.
+        elif len(body) == points * 8 * variables:
+            layout = "<" + "d" * variables
+        else:
+            continue
+        size = struct.calcsize(layout)
+        rows = [struct.unpack_from(layout, body, index * size) for index in range(points)]
+        operating = plot[1].strip().lower().startswith("operating")
+        if raw_path.name.endswith(".op.raw") and lines:
+            continue  # The transient already describes the run.
+        shown = [(name, [row[index] for row in rows]) for index, name in enumerate(names)
+                 if name.upper().startswith(("V(", "I(")) and (operating or name.upper().startswith("V("))]
+        for name, values in shown[:8]:
+            unit = "V" if name.upper().startswith("V(") else "A"
+            if operating or len(values) == 1:
+                lines.append(f"{name} = {values[0]:.4g} {unit}")
+            else:
+                lines.append(f"{name}: {min(values):.4g} to {max(values):.4g} {unit}")
+        if not operating:
+            lines.insert(0, f"{plot[1].strip()}, {points} points.")
+        if lines:
+            break
+    return lines
+
+
+def explain(problems):
+    """LTspice's own messages with a first line that says what to check on the sketch."""
+    text = " ".join(problems)
+    hint = next((message for pattern, message in EXPLANATIONS if re.search(pattern, text, re.IGNORECASE)), None)
+    cleaned = []
+    for line in problems:
+        line = re.sub(r"^[A-Za-z]:\\\\?[^()]*\((\d+)\):\s*", r"Netlist line \1: ", line)  # Drop the file path.
+        if line not in cleaned and not re.fullmatch(r"[\^ ]+", line):
+            cleaned.append(line)
+    return ([hint] if hint else []) + cleaned
+
+
 def simulate(path, timeout=90):
-    """Run the schematic in batch mode. Returns (ok, lines worth showing from the log)."""
+    """Run the schematic in batch mode. Returns (ok, lines): on success what the run found (node voltages),
+    preceded by any warnings; on failure what to check on the sketch, then LTspice's own messages."""
     path = Path(path)
     log = path.with_suffix(".log")
-    log.unlink(missing_ok=True)
+    for old in (log, path.with_suffix(".raw"), path.with_suffix(".op.raw")):
+        old.unlink(missing_ok=True)
     try:
         subprocess.run([str(find_ltspice()), "-b", "-Run", str(path)], timeout=timeout, check=False,
                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     except subprocess.TimeoutExpired:
-        return False, [f"The simulation did not finish within {timeout} s."]
+        return False, [f"The simulation did not finish within {timeout} s. Shorten the .tran time."]
     if not log.is_file():
         return False, ["LTspice did not write a log; open the schematic to see why."]
-    raw = log.read_bytes()
-    text = raw.decode("utf-16-le" if raw[1:2] == b"\x00" else "utf-8", errors="replace")
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    problems = [line for line in lines if re.search(r"error|unknown|singular|fail|can't|cannot|missing", line,
-                                                    re.IGNORECASE)]
-    results = [line for line in lines if re.match(r"[A-Za-z_][\w()]*\s*[:=]", line)
-               and not line.lower().startswith(("circuit", "date", "total elapsed", "tnom", "temp", "method"))]
-    return not problems, (problems or results)[:12]
+    lines = [line.strip() for line in _log_text(log).splitlines() if line.strip()]
+    problems = []
+    for index, line in enumerate(lines):
+        if line.lower().startswith(("circuit:", "files loaded", "ltspice ")) or "succeeded" in line.lower():
+            continue
+        if PROBLEM.search(line) and not re.fullmatch(r"[A-Za-z]:\\[^():]*", line):
+            problems.append(line)
+            following = lines[index + 1] if index + 1 < len(lines) else ""
+            if re.search(r"\(\d+\):", line) and following and not PROBLEM.search(following):
+                problems.append(f"in: {following}")  # LTspice echoes the netlist line it stopped at.
+            elif following.lower().startswith("you will need"):
+                problems.append(following)
+    ran = path.with_suffix(".raw").is_file() or path.with_suffix(".op.raw").is_file()
+    warnings = [line for line in problems if line.lower().startswith("warning")]
+    if not ran or len(warnings) < len([line for line in problems if not line.startswith("in: ")]):
+        return False, (explain(problems) or ["LTspice produced no result; open the schematic to see why."])[:12]
+    return True, ([*explain(warnings), *read_results(path)] or ["The simulation ran."])[:12]

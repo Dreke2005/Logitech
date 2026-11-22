@@ -1,5 +1,6 @@
 """Hardware-free tests using overhead-style hand landmarks in image pixels."""
 
+import hermetic  # noqa: F401
 import math
 import sys
 import unittest

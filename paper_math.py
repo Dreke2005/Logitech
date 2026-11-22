@@ -57,6 +57,37 @@ def python_equation(source):
     return f"{header}def compute_{output}({', '.join(inputs)}):\n    return {ast.unparse(parsed.body)}"
 
 
+GREEK = ("alpha|beta|gamma|delta|epsilon|theta|lambda|mu|sigma|omega|phi|tau|rho|eta|pi|Delta|Omega|Sigma")
+MATH_NAMES = "sin|cos|tan|log|ln|exp|min|max|lim"
+
+
+def display_latex(source):
+    """Display math from a checked equation, written as plain text or already as LaTeX. No model
+    is involved, so nothing is added or changed beyond notation."""
+    lines = [line.strip() for line in source.strip().splitlines() if line.strip()]
+    if not lines:
+        return None
+    converted = []
+    for line in lines:
+        if "\\" not in line and "^{" not in line:
+            line = line.replace("**", "^").replace("−", "-")
+            line = re.sub(r"\^\s*\(([^()]*)\)", r"^{\1}", line)
+            line = re.sub(r"\^\s*([A-Za-z0-9.]+)", r"^{\1}", line)
+            for _ in range(3):
+                line = re.sub(r"\bsqrt\(([^()]*)\)", r"\\sqrt{\1}", line)
+                line = re.sub(r"\(([^()]+)\)\s*/\s*\(([^()]+)\)", r"\\frac{\1}{\2}", line)
+            line = re.sub(rf"(?<![A-Za-z\\])({MATH_NAMES})(?![A-Za-z])", r"\\\1", line)
+            line = re.sub(rf"(?<![A-Za-z\\])({GREEK})(?![A-Za-z])", r"\\\1", line)
+            line = line.replace("<=", r"\leq ").replace(">=", r"\geq ").replace("!=", r"\neq ")
+            line = line.replace("*", r" \cdot ").replace("×", r" \times ")
+            line = " ".join(line.split())
+        converted.append(line)
+    if len(converted) == 1:
+        return "\\[\n" + converted[0] + "\n\\]"
+    body = " \\\\\n".join(line.replace("=", "&=", 1) if "&" not in line else line for line in converted)
+    return "\\[\n\\begin{aligned}\n" + body + "\n\\end{aligned}\n\\]"
+
+
 def latex_equation(source):
     """Format a simple assignment from its transcription without changing the math."""
     if not re.fullmatch(r"[A-Za-z][A-Za-z0-9]*\s*=\s*[A-Za-z0-9. +−×*/^()⁰¹²³⁴⁵⁶⁷⁸⁹⁻⁺-]+",

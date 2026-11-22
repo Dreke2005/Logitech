@@ -59,8 +59,14 @@ def matlab_entry(path):
     return path
 
 
-def open_matlab(path):
-    """Open a .m file (or a project's entry file) in the MATLAB editor, reusing a running MATLAB."""
+matlab_running = _matlab_running
+
+
+def open_matlab(path, run=False):
+    """Open a .m file (or a project's entry file) in the MATLAB editor, reusing a running MATLAB.
+
+    With ``run`` a MATLAB that has to be started also runs the script. A running MATLAB only shows
+    the file: its shell verb opens files and cannot run them."""
     path = matlab_entry(path)
     if _matlab_running() and _matlab_association():
         os.startfile(path)  # MATLAB's shell verb opens the file in the running instance via DDE.
@@ -72,7 +78,8 @@ def open_matlab(path):
         raise OSError("MATLAB was not found. Open the saved .m in your editor.")
     quoted = path.as_posix().replace("'", "''")
     folder = path.parent.as_posix().replace("'", "''")
-    subprocess.Popen([str(matlab), "-sd", folder, "-r", f"cd('{folder}'); edit('{quoted}')"])
+    command = f"cd('{folder}'); edit('{quoted}')" + (f"; run('{quoted}')" if run else "")
+    subprocess.Popen([str(matlab), "-sd", folder, "-r", command])
     return path
 
 

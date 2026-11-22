@@ -1,3 +1,4 @@
+import hermetic  # noqa: F401
 import subprocess
 import tempfile
 import unittest
