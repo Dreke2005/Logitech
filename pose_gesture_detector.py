@@ -1,11 +1,16 @@
-"""Control desktop scrolling, zoom, and mouse clicks with camera 0 gestures.
+"""Repeated scroll/zoom modes and wink clicks using camera 0 hand gestures.
 
-Run with ``uv run python pose_gesture_detector.py``. Show a prayer pose to
-start control. While active, move one open palm vertically to scroll; pinch
-with both hands and move them apart/together to zoom in/out. Wink right eye for right-click or left eye for left-click; both eyes closed does nothing. Show both open
-palms facing the camera to stop. Keep shoulders, arms, wrists, and hands in
-frame. Press Q or ESC to quit.
+Run with ``uv run python pose_gesture_detector.py``. Prayer pose starts control.
+Tilt one open hand to enter scroll_up/down; point the thumb left and curl the
+middle, ring and pinky fingers to enter zoom_in/out with the index finger.
+Each mode repeats its wheel action until both
+hands leave the frame. A right/left wink clicks at the cursor; both eyes closed
+does nothing. Press Q or ESC to quit.
 """
+
+# Author: Victor Lancieux
+# Date: Original date unknown; metadata recorded 2026-11-22.
+# Purpose: Control zoom, scrolling, rotation, and wink clicks with camera 0 gestures.
 
 import argparse
 import time
@@ -56,8 +61,8 @@ def _hand_metrics(landmarks: Any, width: int, height: int) -> Dict[str, Any]:
         "finger_spread": finger_spread,
         "palm_facing_score": palm_facing_score,
         "open": all(extended.values()) and thumb_extended and finger_spread > 1.15,
-        "facing_camera": palm_facing_score > 0.55,
-        "pinching": pinch_ratio < 0.30,
+        "facing_camera": palm_facing_score > 0.35,
+        "pinching": pinch_ratio < 0.45,
         "pinch_center": (points[4] + points[8]) / 2.0,
     }
 
@@ -99,47 +104,99 @@ def detect_stop_pose(results: Any, frame_size: tuple) -> bool:
 
 
 class PoseStateMachine:
-    """Debounce pose events and alternate between waiting, active, and stopped."""
+    """Enter a gesture mode once, then return to active after hands leave view."""
 
-    def __init__(self, hold_frames: int = 6):
+    ACTION_STATES = {"zoom_in", "zoom_out", "scroll_up", "scroll_down",
+                     "rotate"}
+
+    def __init__(self, hold_frames: int = 6, gesture_frames: int = 3,
+                 missing_frames: int = 6):
         self.state = "waiting"
         self.hold_frames = hold_frames
+        self.gesture_frames = gesture_frames
+        self.missing_frames = missing_frames
         self.consecutive = 0
+        self.pending_action = None
+        self.pending_action_frames = 0
+        self.no_hands_frames = 0
 
-    def update(self, prayer: bool, stop: bool) -> Optional[str]:
-        target = prayer if self.state in ("waiting", "stopped") else stop
-        self.consecutive = self.consecutive + 1 if target else 0
-        if self.consecutive < self.hold_frames:
+    def update(self, prayer: bool, stop: bool, action: Optional[str],
+               hands_present: bool) -> Optional[str]:
+        if self.state in ("waiting", "stopped"):
+            self.consecutive = self.consecutive + 1 if prayer else 0
+            if self.consecutive >= self.hold_frames:
+                self.state = "active"
+                self.consecutive = 0
+                return "START"
+            return None
+
+        if self.state in self.ACTION_STATES:
+            self.consecutive = self.consecutive + 1 if stop else 0
+            if self.consecutive >= self.hold_frames:
+                self.state = "stopped"
+                self.consecutive = 0
+                self.no_hands_frames = 0
+                return "STOP"
+            self.no_hands_frames = 0 if hands_present else self.no_hands_frames + 1
+            if self.no_hands_frames >= self.missing_frames:
+                self.state = "active"
+                self.no_hands_frames = 0
+                self.pending_action = None
+                self.pending_action_frames = 0
+                return "RETURN_ACTIVE"
+            return None
+
+        if stop:
+            self.consecutive += 1
+            self.pending_action = None
+            self.pending_action_frames = 0
+            if self.consecutive >= self.hold_frames:
+                self.state = "stopped"
+                self.consecutive = 0
+                return "STOP"
             return None
         self.consecutive = 0
-        if self.state in ("waiting", "stopped"):
-            self.state = "active"
-            return "START"
-        self.state = "stopped"
-        return "STOP"
+
+        if action:
+            if action == self.pending_action:
+                self.pending_action_frames += 1
+            else:
+                self.pending_action = action
+                self.pending_action_frames = 1
+            if self.pending_action_frames >= self.gesture_frames:
+                self.state = action
+                self.pending_action = None
+                self.pending_action_frames = 0
+                self.no_hands_frames = 0
+                return f"MODE:{action}"
+        else:
+            self.pending_action = None
+            self.pending_action_frames = 0
+        return None
 
 
 class DesktopGestureControls:
-    """Translate active hand motion to scroll and Ctrl+wheel zoom actions."""
+    """Classify poses into modes and repeat wheel actions while a mode is active."""
 
     def __init__(self, pyautogui_module: Any):
         self.gui = pyautogui_module
-        self.scroll_side = None
-        self.scroll_y = None
-        self.scroll_remainder = 0.0
-        self.zoom_distance = None
-        self.last_zoom_time = 0.0
+        self.last_action_time = 0.0
+        self.desired_rotation = 0
+        self.applied_rotation = None
+        self.last_rotation_attempt = None
 
     def reset(self) -> None:
-        self.scroll_side = None
-        self.scroll_y = None
-        self.scroll_remainder = 0.0
-        self.zoom_distance = None
+        self.last_action_time = 0.0
+        self.desired_rotation = 0
+        self.applied_rotation = None
+        self.last_rotation_attempt = None
 
-    def update(self, results: Any, frame_size: tuple, active: bool) -> str:
-        if not active:
-            self.reset()
-            return ""
+    def _scroll_at_cursor(self, clicks: int) -> None:
+        """Send wheel input to the exact screen position currently under the mouse."""
+        x, y = self.gui.position()
+        self.gui.scroll(clicks, x=x, y=y)
+
+    def classify(self, results: Any, frame_size: tuple) -> Optional[str]:
         width, height = frame_size
         raw_hands = {
             side: getattr(results, f"{side}_hand_landmarks")
@@ -150,62 +207,162 @@ class DesktopGestureControls:
             for side, hand in raw_hands.items() if hand
         }
 
-        # Both hands pinch together: increasing separation zooms in, decreasing
-        # separation zooms out. The baseline is re-anchored after each zoom step.
-        if all(side in metrics and metrics[side]["pinching"] for side in ("left", "right")):
-            left_center = metrics["left"]["pinch_center"]
-            right_center = metrics["right"]["pinch_center"]
-            distance = _distance(left_center, right_center)
-            self.scroll_side = None
-            self.scroll_y = None
-            self.scroll_remainder = 0.0
-            if self.zoom_distance is None:
-                self.zoom_distance = distance
-                return "ZOOM: pinch both hands and move apart/together"
-            change = distance - self.zoom_distance
-            if abs(change) >= max(24.0, width * 0.035):
-                if time.monotonic() - self.last_zoom_time >= 0.25:
-                    direction = 1 if change > 0 else -1
-                    self.gui.keyDown("ctrl")
-                    try:
-                        self.gui.scroll(direction)
-                    finally:
-                        self.gui.keyUp("ctrl")
-                    self.zoom_distance = distance
-                    self.last_zoom_time = time.monotonic()
-                    return "ZOOM IN" if direction > 0 else "ZOOM OUT"
-            return "ZOOM: move pinched hands apart/together"
-        self.zoom_distance = None
+        # The image is mirrored before tracking, so MediaPipe's "right" label
+        # corresponds to the user's physical left hand in this preview.
+        left_hand = metrics.get("right")
+        if left_hand:
+            fingers = left_hand["extended"]
+            closed_except_index = (
+                fingers["index"] and not fingers["middle"]
+                and not fingers["ring"] and not fingers["pinky"]
+                and not left_hand["thumb_extended"]
+            )
+            if closed_except_index:
+                pts = left_hand["points"]
+                index_vector = pts[8] - pts[5]
+                angle = float(np.degrees(np.arctan2(index_vector[0], -index_vector[1])))
+                # Windows' display orientations are numbered counterclockwise;
+                # negate the image angle so the visible screen turns with the finger.
+                self.desired_rotation = int(round((-angle % 360.0) / 90.0)) % 4
+                return "rotate"
 
-        # Exactly one open, front-facing palm controls vertical page scrolling.
-        open_hands = [
-            side for side, hand in metrics.items()
-            if hand["open"] and hand["facing_camera"]
-        ]
-        if len(open_hands) == 1:
-            side = open_hands[0]
-            y = float(metrics[side]["points"][9][1])
-            if self.scroll_side != side or self.scroll_y is None:
-                self.scroll_side = side
-                self.scroll_y = y
-                self.scroll_remainder = 0.0
-                return "SCROLL: move one open hand up/down"
-            self.scroll_remainder += y - self.scroll_y
-            self.scroll_y = y
-            steps = int(self.scroll_remainder / 28.0)
-            if steps:
-                # PyAutoGUI uses positive wheel units for scrolling upward.
-                self.gui.scroll(-steps)
-                self.scroll_remainder -= steps * 28.0
-                return "SCROLL DOWN" if steps > 0 else "SCROLL UP"
-            return "SCROLL: move one open hand up/down"
+        # Zoom pose: one hand with middle/ring/pinky curled and thumb pointing
+        # left in the mirrored preview. The index points up for zoom out, or is
+        # curled for zoom in. Require one matching hand to avoid ambiguity.
+        zoom_candidates = []
+        for hand in metrics.values():
+            pts = hand["points"]
+            fingers = hand["extended"]
+            thumb_points_left = (
+                pts[4][0] - pts[2][0] < -max(6.0, hand["palm_width"] * 0.20)
+            )
+            other_fingers_curled = not fingers["middle"] and not fingers["ring"] and not fingers["pinky"]
+            if not thumb_points_left or not other_fingers_curled:
+                continue
+            index_points_up = (
+                fingers["index"]
+                and pts[8][1] < pts[5][1] - 0.22 * hand["length"]
+            )
+            if index_points_up:
+                zoom_candidates.append("zoom_out")
+            elif not fingers["index"]:
+                zoom_candidates.append("zoom_in")
+        if len(zoom_candidates) == 1:
+            return zoom_candidates[0]
 
-        self.scroll_side = None
-        self.scroll_y = None
-        self.scroll_remainder = 0.0
-        return ""
+        # One open, camera-facing hand; either tracker label is accepted because
+        # the mirrored preview can invert MediaPipe's left/right label.
+        open_hands = [hand for hand in metrics.values()
+                      if hand["open"] and hand["facing_camera"]]
+        if len(open_hands) != 1:
+            return None
+        hand = open_hands[0]
+        vector = hand["points"][12] - hand["points"][0]
+        tilt = float(np.degrees(np.arctan2(vector[0], -vector[1])))
+        if tilt <= -12.0:
+            return "scroll_down"
+        if tilt >= 12.0:
+            return "scroll_up"
+        return None
 
+    def apply_mode(self, mode: str, interval: float = 0.25) -> None:
+        """Apply wheel pulses or the index-selected Windows display rotation."""
+        if mode == "rotate":
+            if (self.applied_rotation != self.desired_rotation
+                    and self.last_rotation_attempt != self.desired_rotation):
+                self.last_rotation_attempt = self.desired_rotation
+                result = self._set_display_orientation(self.desired_rotation)
+                if result == 0:
+                    self.applied_rotation = self.desired_rotation
+                    print(f"SCREEN_ROTATION={self.desired_rotation * 90} degrees")
+                else:
+                    print(f"SCREEN_ROTATION_FAILED=Windows display mode result {result}")
+            return
+        now = time.monotonic()
+        if now - self.last_action_time < interval:
+            return
+        if mode == "scroll_down":
+            self._scroll_at_cursor(-200)
+        elif mode == "scroll_up":
+            self._scroll_at_cursor(200)
+        elif mode in ("zoom_in", "zoom_out"):
+            clicks = 1 if mode == "zoom_in" else -1
+            self.gui.keyDown("ctrl")
+            try:
+                self._scroll_at_cursor(clicks)
+            finally:
+                self.gui.keyUp("ctrl")
+        else:
+            return
+        self.last_action_time = now
 
+    @staticmethod
+    def _set_display_orientation(orientation: int) -> int:
+        """Set the primary Windows display orientation; return its Win32 result."""
+        if not hasattr(__import__("ctypes"), "windll"):
+            return -1
+        import ctypes
+
+        DWORD = ctypes.c_uint32
+        LONG = ctypes.c_int32
+        WORD = ctypes.c_uint16
+        SHORT = ctypes.c_int16
+
+        class POINTL(ctypes.Structure):
+            _fields_ = [("x", LONG), ("y", LONG)]
+
+        class DisplayPosition(ctypes.Structure):
+            _fields_ = [("position", POINTL), ("orientation", DWORD),
+                        ("fixed_output", DWORD)]
+
+        class PrinterFields(ctypes.Structure):
+            _fields_ = [("orientation", SHORT), ("paper_size", SHORT),
+                        ("paper_length", SHORT), ("paper_width", SHORT),
+                        ("scale", SHORT), ("copies", SHORT),
+                        ("default_source", SHORT), ("print_quality", SHORT)]
+
+        class ModeUnion(ctypes.Union):
+            _fields_ = [("display", DisplayPosition), ("printer", PrinterFields)]
+
+        class DisplayFlags(ctypes.Union):
+            _fields_ = [("display_flags", DWORD), ("nup", DWORD)]
+
+        class DEVMODEW(ctypes.Structure):
+            _anonymous_ = ("mode", "flags")
+            _fields_ = [
+                ("device_name", ctypes.c_wchar * 32), ("spec_version", WORD),
+                ("driver_version", WORD), ("size", WORD), ("driver_extra", WORD),
+                ("fields", DWORD), ("mode", ModeUnion), ("color", SHORT),
+                ("duplex", SHORT), ("y_resolution", SHORT), ("tt_option", SHORT),
+                ("collate", SHORT), ("form_name", ctypes.c_wchar * 32),
+                ("log_pixels", WORD), ("bits_per_pixel", DWORD),
+                ("width", DWORD), ("height", DWORD), ("flags", DisplayFlags),
+                ("frequency", DWORD), ("icm_method", DWORD), ("icm_intent", DWORD),
+                ("media_type", DWORD), ("dither_type", DWORD), ("reserved1", DWORD),
+                ("reserved2", DWORD), ("panning_width", DWORD),
+                ("panning_height", DWORD),
+            ]
+
+        user32 = ctypes.windll.user32
+        current = DEVMODEW()
+        current.size = ctypes.sizeof(DEVMODEW)
+        if not user32.EnumDisplaySettingsW(None, -1, ctypes.byref(current)):
+            return -2
+
+        old_orientation = int(current.display.orientation)
+        orientation %= 4
+        old_portrait = old_orientation in (1, 3)
+        new_portrait = orientation in (1, 3)
+        current.display.orientation = orientation
+        current.fields |= 0x00000080  # DM_DISPLAYORIENTATION
+        if old_portrait != new_portrait:
+            current.width, current.height = current.height, current.width
+            current.fields |= 0x00080000 | 0x00100000  # DM_PELSWIDTH | DM_PELSHEIGHT
+
+        test_result = user32.ChangeDisplaySettingsW(ctypes.byref(current), 2)  # CDS_TEST
+        if test_result != 0:
+            return int(test_result)
+        return int(user32.ChangeDisplaySettingsW(ctypes.byref(current), 0))
 
 # MediaPipe Face Mesh eye landmarks: (outer-left, upper-left, upper-right,
 # outer-right, lower-right, lower-left), expressed in image coordinates.
@@ -213,7 +370,7 @@ EYE_LANDMARKS = {
     "left": (362, 385, 387, 263, 373, 380),
     "right": (33, 160, 158, 133, 153, 144),
 }
-EYE_CLOSED_EAR = 0.20
+EYE_CLOSED_EAR = 0.20*0.8
 
 
 def _eye_aspect_ratio(face_landmarks: Any, indices: tuple, width: int, height: int) -> float:
@@ -250,8 +407,10 @@ class EyeClickController:
             return ""
 
         width, height = frame_size
-        left_ear = _eye_aspect_ratio(face_landmarks, EYE_LANDMARKS["left"], width, height)
-        right_ear = _eye_aspect_ratio(face_landmarks, EYE_LANDMARKS["right"], width, height)
+        #Eye aspect ratio (EAR) is a measure of eye openness. A lower EAR indicates a closed eye.
+        #swapping left and right because the camera view is mirrored.
+        left_ear = _eye_aspect_ratio(face_landmarks, EYE_LANDMARKS["right"], width, height) 
+        right_ear = _eye_aspect_ratio(face_landmarks, EYE_LANDMARKS["left"], width, height)
         left_closed = left_ear < EYE_CLOSED_EAR
         right_closed = right_ear < EYE_CLOSED_EAR
 
@@ -310,7 +469,11 @@ def run(camera_index: int = 0, confidence: float = 0.55) -> None:
     try:
         capture, info = open_camera(camera_index, fourcc=None)
         print(f"Camera {camera_index}: {info['width']}x{info['height']} [{info['backend']}]")
-        print("Start: prayer. Scroll: one open palm up/down. Zoom: pinch both hands apart/together.")
+        print("Start: prayer. Tilt one open hand left/right for scroll.")
+        print("Rotate: physical left hand, curl all but index; screen orientation follows index direction.")
+        print("Index up sets the screen upright; remove both hands to leave rotate mode.")
+        print("Wheel pulses repeat while in a mode; move both hands out of frame to return to active.")
+        print("Zoom: curl middle/ring/pinky and point thumb left; index up=out, index curled=in.")
         print("Click: wink right eye for right-click, left eye for left-click; both closed is ignored.")
         print("Stop: both open palms facing camera. Press Q or ESC to quit.")
         while True:
@@ -326,15 +489,20 @@ def run(camera_index: int = 0, confidence: float = 0.55) -> None:
             size = (frame.shape[1], frame.shape[0])
             prayer = detect_prayer_pose(result, size)
             stop = detect_stop_pose(result, size)
-            event = machine.update(prayer, stop)
+            hands_present = bool(result.left_hand_landmarks or result.right_hand_landmarks)
+            candidate = (controls.classify(result, size)
+                         if machine.state in ("active", "rotate") else None)
+            event = machine.update(prayer, stop, candidate, hands_present)
             if event:
                 print(f"POSE_EVENT={event}")
-            active = machine.state == "active" and event != "STOP"
-            action = controls.update(result, size, active)
+                if event in ("STOP", "RETURN_ACTIVE"):
+                    controls.reset()
+            if machine.state in PoseStateMachine.ACTION_STATES:
+                controls.apply_mode(machine.state)
+            active = machine.state == "active"
             eye_action = eye_clicks.update(result.face_landmarks, size, active)
             if eye_action:
                 print(f"EYE_EVENT={eye_action}")
-                action = eye_action
 
             if result.pose_landmarks:
                 _draw_chain(frame, result.pose_landmarks, POSE_EDGES, (0, 220, 0))
@@ -359,9 +527,19 @@ def run(camera_index: int = 0, confidence: float = 0.55) -> None:
                               f"(closed < {EYE_CLOSED_EAR:.2f})")
                 cv2.putText(frame, eye_status, (12, 58), cv2.FONT_HERSHEY_SIMPLEX,
                             0.52, (0, 255, 0), 2)
-            if action:
-                cv2.putText(frame, action, (12, 84), cv2.FONT_HERSHEY_SIMPLEX,
-                            0.52, (0, 255, 0), 2)
+            state_prompts = {
+                "waiting": "Hold prayer pose to start",
+                "active": "Active: scroll tilt | zoom: thumb left, 3 fingers curled, index up/out or curled/in",
+                "zoom_in": "ZOOM IN mode - remove both hands to return active",
+                "zoom_out": "ZOOM OUT mode - remove both hands to return active",
+                "scroll_up": "SCROLL UP mode - remove both hands to return active",
+                "scroll_down": "SCROLL DOWN mode - remove both hands to return active",
+                "rotate": (f"ROTATE mode: index sets {controls.desired_rotation * 90} degrees - "
+                           "remove both hands to return active"),
+                "stopped": "Stopped: hold prayer pose to restart",
+            }
+            cv2.putText(frame, state_prompts[machine.state], (12, 84),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 255, 0), 2)
             cv2.imshow("Pose gesture controls - camera 0", frame)
             if cv2.waitKey(1) & 0xFF in (ord("q"), 27):
                 break
@@ -385,6 +563,18 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 

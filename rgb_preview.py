@@ -1,5 +1,9 @@
 """RGB preview with fingertip tracking, gaze control, and visual speech recognition."""
 
+# Author: Victor Lancieux's collaborator (name not provided)
+# Date: Original date unknown; restored beside the launcher on 2026-11-22.
+# Purpose: Provide RGB keyboard, hand-navigation, gaze, and lip-reading modes.
+
 import argparse
 import json
 import multiprocessing as mp
@@ -18,6 +22,15 @@ CALIBRATION_WINDOW = "Gaze calibration"
 
 def _capture(device, backend, width, height, output, stop, model_path=None, mirror=False,
              eye_model_path=None, exposure_lock=None):
+# This restored entrypoint lives beside the keyboard detector, while its
+# hand/gaze implementation modules remain in the copied Logitech-Keypad folder.
+_COPIED_PROJECT_DIR = Path(__file__).resolve().parent / "Logitech-Keypad"
+if _COPIED_PROJECT_DIR.is_dir():
+    sys.path.insert(0, str(_COPIED_PROJECT_DIR))
+
+
+def _capture(device, backend, width, height, output, stop, model_path=None, mirror=False,
+             eye_model_path=None):
     """Isolate native camera calls so a blocked driver can be stopped."""
     from camera_utils import open_camera
 
@@ -54,6 +67,7 @@ def _capture(device, backend, width, height, output, stop, model_path=None, mirr
 
             parent = multiprocessing.parent_process()
             while not stop.is_set() and (parent is None or parent.is_alive()):
+            while not stop.is_set():
                 ok, frame = cap.read()
                 if not ok or frame is None:
                     stop.wait(0.05)
@@ -81,6 +95,10 @@ def _capture(device, backend, width, height, output, stop, model_path=None, mirr
 
 
 def _desktop_banner(frame, status, gesture_status, navigation_status=None):
+
+
+def _desktop_banner(frame, status, gesture_status, navigation_status=None,
+                    eye_debug=None):
     top, width = frame.shape[:2]
     lines = [status]
     if gesture_status:
@@ -88,6 +106,9 @@ def _desktop_banner(frame, status, gesture_status, navigation_status=None):
     if navigation_status:
         lines.append(navigation_status)
     lines.append("Ctrl+Alt+F8   Pause / resume")
+    lines.append("Hand control active | Ctrl+Alt+F8 pauses/resumes")
+    if eye_debug:
+        lines.append(eye_debug)
     frame = cv2.copyMakeBorder(frame, 0, 14 + 23 * len(lines), 0, 0, cv2.BORDER_CONSTANT,
                                value=(25, 30, 41))
     font = cv2.FONT_HERSHEY_SIMPLEX
@@ -183,6 +204,12 @@ def main():
     parser.add_argument("--no-keyboard", action="store_true", help="Show fingertip tracking without the keyboard")
     parser.add_argument("--mode", choices=("keyboard", "desktop", "touchpad", "eye", "lip"),
                         default="keyboard", help="Use the virtual keyboard, desktop control, or live lip reading")
+    parser.add_argument("--right-hand-only", action="store_true",
+                        help="Use only MediaPipe's Right hand for touchpad gestures")
+    parser.add_argument("--hand-pointer", action="store_true",
+                        help="Catch/drag the pointer with the left index pointing left")
+    parser.add_argument("--wink-clicks", action="store_true",
+                        help="Enable left/right wink clicks without gaze cursor control")
     parser.add_argument("--mirror", action="store_true", help="Mirror video before tracking; coordinates follow the display")
     parser.add_argument("--model", type=Path, help="Local hand_landmarker.task; default downloads Google's model once")
     parser.add_argument("--eye-model", type=Path, help="Local face_landmarker.task for eye or desktop mode")
@@ -204,6 +231,12 @@ def main():
     hand_tracking = not args.no_hands and args.mode in ("keyboard", "desktop", "touchpad")
     if hand_gestures and args.no_hands:
         parser.error("Desktop and touchpad modes require hand tracking.")
+    if args.right_hand_only and not hand_gestures:
+        parser.error("--right-hand-only requires --mode desktop or --mode touchpad.")
+    if args.hand_pointer and args.mode != "touchpad":
+        parser.error("--hand-pointer requires --mode touchpad.")
+    if args.wink_clicks and args.mode != "touchpad":
+        parser.error("--wink-clicks requires --mode touchpad.")
     if args.landmarks_jsonl and not hand_tracking:
         parser.error("--landmarks-jsonl requires a mode with hand tracking enabled.")
     clip = None
@@ -242,6 +275,7 @@ def main():
     model_path = None
     eye_model_path = None
     if eye_control:
+    if eye_control or args.wink_clicks:
         from eye_pointer import ensure_eye_model
 
         eye_model_path = args.eye_model.resolve() if args.eye_model else ensure_eye_model()
@@ -262,6 +296,14 @@ def main():
             if not path.is_file():
                 parser.error(f"Lip model file is missing at {path}. See silent_transcription_setup.md.")
     print(f"Opening camera {args.device} via {args.backend}; press q or Escape to quit.", flush=True)
+    if args.right_hand_only:
+        print("Touchpad gestures are restricted to the Right hand.", flush=True)
+    if args.hand_pointer:
+        print("Point the left index horizontally left to catch; move to drag; release to re-anchor.",
+              flush=True)
+    if args.wink_clicks:
+        print("Winks use EAR: left eye=left click, right eye=right click; both closed is ignored.",
+              flush=True)
     ctx = mp.get_context("spawn")
     output, stop = ctx.Queue(maxsize=1), ctx.Event()
     worker = ctx.Process(target=_capture, args=(args.device, args.backend, args.width,
@@ -271,6 +313,10 @@ def main():
     desktop = gestures = gaze = None
     desktop_enabled = shortcut_held = False
     status = "Paused. Press Ctrl+Alt+F8 to enable desktop control."
+    desktop = gestures = gaze = hand_pointer = wink_clicker = None
+    desktop_enabled = True
+    shortcut_held = False
+    status = "Enabled. Mouse and hand controls are active."
     gesture_status = None
     calibration_screen = None
     if hand_gestures or eye_control:
@@ -281,6 +327,14 @@ def main():
             from gesture_touchpad import TouchpadController
 
             gestures = TouchpadController(desktop)
+        if args.hand_pointer:
+            from hand_pointer import HandPointerController
+
+            hand_pointer = HandPointerController(desktop)
+        if args.wink_clicks:
+            from wink_clicks import WinkClickController
+
+            wink_clicker = WinkClickController(desktop)
         if eye_control:
             from eye_pointer import EyePointer
 
@@ -354,6 +408,8 @@ def main():
                 if desktop_enabled and not reset_for_gap and time.monotonic() - last_frame > 0.25:
                     if gestures is not None:
                         gestures.tracking_lost()
+                    if hand_pointer is not None:
+                        hand_pointer.release()
                     if gaze is not None and not gaze.calibrating:
                         gaze.pause()
                     reset_for_gap = True
@@ -392,6 +448,16 @@ def main():
                             frame = keyboard.add_text_panel(frame)
                 if desktop is not None:
                     navigation_status = None
+                    pointer_status = None
+                    if hand_pointer is not None:
+                        pointer_status = hand_pointer.update(
+                            tracking, enabled=desktop_enabled and not shortcut_held)
+                    wink_status = None
+                    if wink_clicker is not None:
+                        wink_status = wink_clicker.update(
+                            eye_sample,
+                            enabled=desktop_enabled and not shortcut_held,
+                        )
                     if desktop_enabled and not shortcut_held:
                         if gaze is not None:
                             status = gaze.update(eye_sample)
@@ -403,6 +469,35 @@ def main():
                             else:
                                 gesture_status = hand_status
                     frame = _desktop_banner(frame, status, gesture_status, navigation_status)
+                            gesture_tracking = tracking
+                            if args.right_hand_only and tracking is not None:
+                                gesture_tracking = dict(tracking)
+                                gesture_tracking["hands"] = [
+                                    hand for hand in tracking["hands"]
+                                    if str(hand.get("handedness", "")).strip().lower() == "right"
+                                ]
+                            hand_status = gestures.update(gesture_tracking)
+                            navigation_status = desktop.navigation_feedback()
+                            if gaze is None:
+                                status = hand_status
+                                if pointer_status:
+                                    gesture_status = pointer_status
+                            else:
+                                gesture_status = hand_status
+                    elif pointer_status:
+                        gesture_status = pointer_status
+                    if wink_status:
+                        gesture_status = wink_status
+                    eye_debug = None
+                    if args.wink_clicks:
+                        ear = eye_sample.get("ear") if eye_sample else None
+                        if ear:
+                            eye_debug = (f"EAR L={ear[0]:.2f} R={ear[1]:.2f} "
+                                         f"(closed < {wink_clicker.closed_threshold:.2f})")
+                        else:
+                            eye_debug = "EAR: face/eyes not detected"
+                    frame = _desktop_banner(frame, status, gesture_status,
+                                            navigation_status, eye_debug)
                 if not args.no_display and (gaze is None or not gaze.calibrating):
                     cv2.imshow(title, frame)
                 if args.frames and count >= args.frames:
@@ -459,6 +554,10 @@ def main():
             clip.finish()
         if lip_reader is not None:
             lip_reader.close()
+        if hand_pointer is not None:
+            hand_pointer.close()
+        if wink_clicker is not None:
+            wink_clicker.reset(armed=False)
         _pause_controls(gestures, gaze)
         stop.set()
         if worker.pid is not None:
