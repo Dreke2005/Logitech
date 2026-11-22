@@ -21,6 +21,7 @@ import numpy as np
 
 from camera_utils import open_camera
 from find_keyboard import find_keyboard_corners
+from keyboard_tracker2 import beacon_centers, keyboard_corners_from_poses
 from hand_only_capture import HAND_CONNECTIONS, ensure_hand_model
 from keyboard_tracker import (
     KeyboardDetection,
@@ -28,6 +29,7 @@ from keyboard_tracker import (
     finger_pose_to_key,
 )
 
+BEACON = True
 OUTPUT_SIZE = (1000, 284)
 HALF_KEY_OFFSET_PX = 20.0
 HAND_CONTACT_OFFSETS = {
@@ -47,7 +49,6 @@ FINGER_JOINTS = {
     "ring": ((13, 14, 15), (14, 15, 16)),
     "pinky": ((17, 18, 19), (18, 19, 20)),
 }
-
 
 def _meter_exposure_on_keyboard(capture: Any, frame: np.ndarray,
                                 corners: np.ndarray, state: Dict[str, Any]) -> None:
@@ -519,26 +520,35 @@ def run(camera_index: int = 1, confidence: float = 0.55,
             state["frame_count"] += 1
             if (state["calibration"] is None and not state["selecting"]
                     and state["frame_count"] % 8 == 0):
-                candidate = find_keyboard_corners(frame)
-                if candidate is not None:
-                    candidate = np.array([candidate[i] for i in (3, 2, 1, 0)])  # BR, BL, TL, TR
-                previous_candidate = state["auto_candidate"]
-                if candidate is None:
-                    state["auto_candidate"] = None
-                    state["auto_candidate_hits"] = 0
-                elif (previous_candidate is not None
-                      and np.max(np.linalg.norm(candidate - previous_candidate, axis=1)) < 20):
-                    state["auto_candidate"] = candidate
-                    state["auto_candidate_hits"] += 1
+                if BEACON:
+                    candidate = keyboard_corners_from_poses(beacon_centers(frame))
+                    if candidate is not None:
+                        state["auto_candidate"] = candidate
+                        state["calibration"] = state["auto_candidate"]
+                        state["points"] = state["calibration"].tolist()
+                        state["auto_candidate"] = None
+                        print("Keyboard detected automatically; mapped fingers are active.")
                 else:
-                    state["auto_candidate"] = candidate
-                    state["auto_candidate_hits"] = 1
-                if state["auto_candidate_hits"] >= 3:
-                    state["calibration"] = state["auto_candidate"]
-                    state["points"] = state["calibration"].tolist()
-                    state["auto_candidate"] = None
-                    state["auto_candidate_hits"] = 0
-                    print("Keyboard detected automatically; mapped fingers are active.")
+                    candidate = find_keyboard_corners(frame)
+                    if candidate is not None:
+                        candidate = np.array([candidate[i] for i in (3, 2, 1, 0)])  # BR, BL, TL, TR
+                    previous_candidate = state["auto_candidate"]
+                    if candidate is None:
+                        state["auto_candidate"] = None
+                        state["auto_candidate_hits"] = 0
+                    elif (previous_candidate is not None
+                        and np.max(np.linalg.norm(candidate - previous_candidate, axis=1)) < 20):
+                        state["auto_candidate"] = candidate
+                        state["auto_candidate_hits"] += 1
+                    else:
+                        state["auto_candidate"] = candidate
+                        state["auto_candidate_hits"] = 1
+                    if state["auto_candidate_hits"] >= 3:
+                        state["calibration"] = state["auto_candidate"]
+                        state["points"] = state["calibration"].tolist()
+                        state["auto_candidate"] = None
+                        state["auto_candidate_hits"] = 0
+                        print("Keyboard detected automatically; mapped fingers are active.")
             # Meter the camera's actual exposure from the keyboard, without
             # applying any brightness or contrast filter to captured pixels.
             if state["calibration"] is not None:

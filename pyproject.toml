@@ -18,6 +18,7 @@ dependencies = [
     "pygrabber>=0.2",
     "mediapipe>=1.2.3",
     "pyautogui>=0.9.54",
+    "pynput>=1.8.2",
 ]
 
 [dependency-groups]
