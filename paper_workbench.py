@@ -1,14 +1,17 @@
 """Capture handwriting with the LogiInsight RGB camera and review model drafts."""
 
 import argparse
+import json
 import multiprocessing as mp
 import os
 import queue
 import shutil
 import subprocess
+import sys
 import time
 import tkinter as tk
 import webbrowser
+from dataclasses import replace
 from functools import partial
 from pathlib import Path
 from threading import Thread
@@ -18,7 +21,9 @@ import cv2
 
 from fingertip_tracker import DEFAULT_MODEL
 from local_model import MODEL
-from paper_context import end_circle_enabled
+from paper_camera_check import choose_camera
+from paper_check import check_derivation
+from paper_context import end_circle_enabled, project_hints
 from paper_conversion import (
     DIRECT_TARGETS,
     LANGUAGES,
@@ -27,10 +32,15 @@ from paper_conversion import (
     convert_transcription,
     read_page_source,
     read_recording,
+    read_still,
 )
 import paper_clipboard
 from paper_clipboard import write_new_file
+import paper_forge
 import paper_git
+import paper_ltspice
+import paper_plan
+import paper_project
 from paper_handoff import ask_vscode, open_code, open_matlab, package_latex, save_generated, save_project
 from paper_keypad import MENUS, ROOT, KeypadSession, current_state, send_route, send_slot
 from paper_math import latex_equation
@@ -41,9 +51,12 @@ from rgb_preview import _capture
 
 
 
-def _read_tracked(bench, *args):
+def _read_tracked(bench, selected, target, language, workflow, model):
     """read_recording that remembers whether the pen trace or the photo fallback produced the text."""
-    reading = read_recording(*args)
+    repo, saved = getattr(bench, "git_repo", None), getattr(bench, "saved", None)
+    folder = {"Git": repo, "GitHub": repo, "GitLab": repo, "LaTeX": getattr(bench, "report_folder", None)}.get(
+        target, saved if saved and saved.is_dir() else repo)
+    reading = read_recording(selected, target, language, workflow, model, hints=project_hints(target, folder))
     bench.reading_path = getattr(reading, "path", None)
     return reading
 
@@ -76,7 +89,16 @@ class PaperWorkbench:
         self.camera_failed = False
         self.pasted = False
         self.preview_update = 0
+        self.last_app = "vscode"  # The app page used last; version control acts on its project.
+        self.repo_pin = None  # A repository picked with Browse, kept while the same app is used.
+        self.project_of = {}  # Per app page: the file or folder the workbench opened last.
+        self.active_key = None  # (menu, key) of the action being worked on, shown on the keypad.
+        self.key_result = None  # ("done" | "error", time) of the last finished action.
+        self.key_state = None
+        self.toast_window = None
         self.status = tk.StringVar(value="Start the RGB camera or open a photo of your handwriting.")
+        self.status.trace_add("write", lambda *_: self.announce())
+        self.load_settings()
         self.destination = tk.StringVar(value="Choose an app")
         window.title("LogiInsight Paper")
         width = min(1090, window.winfo_screenwidth() - 30)
@@ -124,6 +146,74 @@ class PaperWorkbench:
         self.render_buttons()
         self.tick()
 
+    # Hands-off use: remembered folders, key status on the keypad, and pop-up results --------------
+
+    def load_settings(self):
+        """Folders chosen once are remembered, so the keypad never has to ask again."""
+        try:
+            saved = json.loads((ROOT / "settings.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        for name in ("git_repo", "report_folder"):
+            folder = saved.get(name) if isinstance(saved, dict) else None
+            if isinstance(folder, str) and Path(folder).is_dir():
+                setattr(self, name, Path(folder))
+        if isinstance(saved, dict) and saved.get("language") in LANGUAGES:
+            self.language = saved["language"]
+
+    def save_settings(self):
+        try:
+            ROOT.mkdir(parents=True, exist_ok=True)
+            (ROOT / "settings.json").write_text(json.dumps({
+                "git_repo": str(self.git_repo) if self.git_repo else None,
+                "report_folder": str(self.report_folder) if self.report_folder else None,
+                "language": self.language}), encoding="utf-8")
+        except OSError:
+            pass
+
+    def key_status(self):
+        """(key, status) for the keypad: recording, busy, then done or error for a few seconds."""
+        if self.active_key is None:
+            return None, None, None
+        menu, key = self.active_key
+        if self.writing_workflow is not None and not self.busy:
+            return key, "recording", menu
+        if self.busy:
+            return key, "busy", menu
+        if self.key_result is not None and time.monotonic() - self.key_result[1] < 5:
+            return key, self.key_result[0], menu
+        return None, None, None
+
+    def announce(self):
+        """Show the status line as a small pop-up when the workbench window is not in front."""
+        text = self.status.get()
+        try:
+            hidden = self.window.state() == "iconic" or self.window.focus_displayof() is None
+        except tk.TclError:
+            return
+        if not hidden or not text:
+            return
+        if self.toast_window is not None:
+            try:
+                self.toast_window.destroy()
+            except tk.TclError:
+                pass
+        toast = self.toast_window = tk.Toplevel(self.window)
+        toast.overrideredirect(True)
+        toast.attributes("-topmost", True)
+        toast.configure(background="#181c24")
+        title = "PaperBridge" if self.target is None else f"PaperBridge · {self.target}"
+        tk.Label(toast, text=title, foreground="#86e3c4", background="#181c24", anchor="w",
+                 font=("Segoe UI", 9, "bold")).pack(fill="x", padx=14, pady=(10, 0))
+        tk.Label(toast, text=text, foreground="#f0f0f0", background="#181c24", wraplength=360, justify="left",
+                 anchor="w", font=("Segoe UI", 10)).pack(fill="x", padx=14, pady=(2, 12))
+        toast.update_idletasks()
+        width, height = max(300, toast.winfo_reqwidth()), toast.winfo_reqheight()
+        x = toast.winfo_screenwidth() - width - 24
+        y = toast.winfo_screenheight() - height - 72
+        toast.geometry(f"{width}x{height}+{x}+{y}")
+        toast.after(5500, lambda: toast.winfo_exists() and toast.destroy())
+
     def actions(self):
         menu = self.current_menu()
         return [(button[1], partial(self.dispatch, menu, button[0])) for button in MENUS[menu]]
@@ -136,7 +226,8 @@ class PaperWorkbench:
             return
         if self.busy:
             if menu == self.menu and {"code": "default", "graph": "graph", "project": "project",
-                                      "equation": "equation", "table": "table",
+                                      "equation": "equation", "table": "table", "flow": "flow",
+                                      "issue": "forge_issue", "request": "forge_request", "gantt": "gantt",
                                       "diagram": "diagram"}.get(action) == self.workflow:
                 return
             self.pending_action = menu, action
@@ -144,6 +235,13 @@ class PaperWorkbench:
         if menu == "home":
             if self.menu != action or self.languages:
                 self.select(action)
+            return
+        if menu in ("git", "git_remote") and self.menu not in ("git", "git_remote") and action in (
+                "commit", "push", "pull", "web", "publish", "browse"):
+            # Pressed on the keypad's version-control page while working in an app: act on that
+            # app's project without leaving its page.
+            self.active_key, self.key_result = (menu, action), None
+            self.git_dispatch(action)
             return
         if action == "home":
             self.select("home")
@@ -155,18 +253,33 @@ class PaperWorkbench:
             self.writing_workflow = None
             if action in LANGUAGES:
                 self.language = action
+                self.save_settings()
                 self.clear_draft()
             self.languages = False
             self._show_menu()
             return
-        if target_menu == "git":
+        if action not in ("camera", "home", "languages", "photo", "save_photo", "browse", "open", "save", "remote",
+                          "back"):
+            self.active_key, self.key_result = (target_menu, action), None
+        if target_menu in ("git", "git_remote"):
             self.git_dispatch(action)
+            return
+        if action == "gantt":
+            self.writing_action("gantt")
+            if self.writing_workflow == "gantt":
+                self.status.set("Write the tasks top to bottom with durations (2w, 3d) and mark milestones. Press "
+                                "Gantt again or lift your hand when done.")
+            return
+        if action == "flow":
+            self.writing_action("flow")
+            if self.writing_workflow == "flow":
+                self.status.set("Draw boxes and arrows. Press Flow again or lift your hand when done.")
             return
         handlers = {
             "camera": self.toggle_camera, "open": self.open_draft, "save": self.save,
             "photo": self.open_photo, "copy": self.copy_draft, "paste": self.paste,
             "chat": self.chatgpt, "save_photo": self.save_photo,
-            "browse": self.browse_report, "overleaf": self.open_overleaf,
+            "browse": self.browse_report, "overleaf": self.open_overleaf, "simulate": self.simulate,
         }
         workflows = {"code": "default", "equation": "equation", "project": "project",
                      "brief": "idea", "circuit": "default", "graph": "graph"}
@@ -208,17 +321,22 @@ class PaperWorkbench:
 
     def publish(self):
         try:
+            self.key_state = self.key_status()
             self.keypad.publish([name for name, _ in self.actions_drawn] + [""] * (9 - len(self.actions_drawn)),
-                                self.current_menu(), self.camera is not None)
+                                self.current_menu(), self.camera is not None, *self.key_state)  # key, status, menu
         except OSError as error:
             self.status.set(f"Could not update keypad labels: {error}")
 
     def select(self, menu):
         if self.busy:
             return
+        if menu not in ("home", "git", "git_remote"):
+            if menu != self.last_app:
+                self.repo_pin = None
+            self.last_app = menu
         self.menu, self.languages = menu, False
         self.writing_workflow = None
-        self.target = dict(MENUS["home"]).get(menu)
+        self.target = "Git" if menu in ("git", "git_remote") else dict(MENUS["home"]).get(menu)
         self.clear_draft()
         self._show_menu()
         self.status.set("Choose an app." if self.target is None else
@@ -249,13 +367,12 @@ class PaperWorkbench:
 
         try:
             names = FilterGraph().get_input_devices()
-            device = self.args.camera
+            # The LogiInsight RGB stream when connected, otherwise the first ordinary webcam. Both go
+            # through the same capture worker, hand tracking, and writing session.
+            device, logitech = choose_camera(names, self.args.camera)
             if device is None:
-                device = next((i for i, name in enumerate(names) if "lvnext" in name.lower()
-                               and not any(part in name.lower() for part in ("cpd", "hello"))), None)
-            if device is None or not 0 <= device < len(names):
                 self.camera_failed = True
-                self.status.set("LogiInsight RGB is unavailable. Reconnect it or start with --camera INDEX.")
+                self.status.set("No camera found. Connect the LogiInsight camera or a webcam.")
                 return
             ctx = mp.get_context("spawn")
             output, stop = ctx.Queue(1), ctx.Event()
@@ -270,7 +387,8 @@ class PaperWorkbench:
             self.preview_live = True
             self.preview_update = 0
             self.render_buttons()
-            self.status.set(f"Opening {names[device]}...")
+            self.status.set(f"Opening {names[device]}..." if logitech else
+                            f"LogiInsight camera not connected: using {names[device]}. Aim it at the paper.")
         except (OSError, RuntimeError) as error:
             self.camera_failed = True
             self.status.set(f"Camera error: {error}")
@@ -409,6 +527,9 @@ class PaperWorkbench:
         self.source.insert("1.0", text)
 
     def writing_action(self, workflow):
+        if (not self.camera and not self.page_pinned and self.roi is None and self.page is None
+                and not (workflow == "graph" and self.pasted)):
+            self.start_camera()  # One key press: the action key starts the camera when it is off.
         if not self.camera or self.page_pinned or self.roi is not None or (workflow == "graph" and self.pasted):
             self.convert(workflow)
             return
@@ -422,6 +543,8 @@ class PaperWorkbench:
         purpose = {"default": "code", "graph": "a plot", "project": "a project", "equation": "an equation",
                    "git_repo": "a repository idea", "git_branch": "a branch name",
                    "git_commit": "a commit message", "diagram": "a branch diagram",
+                   "forge_issue": "an issue", "forge_request": "a request title", "flow": "a flowchart",
+                   "gantt": "a project plan",
                    "table": "a table"}.get(workflow, "writing")
         if self.frame is None:
             self.writing = WritingSession()
@@ -455,6 +578,8 @@ class PaperWorkbench:
         if self.busy or self.target is None:
             return
         pasted_plot = workflow == "graph" and self.pasted
+        if not pasted_plot and self.camera is None and self.page is None:
+            self.start_camera()
         if not pasted_plot and self.preview_live and self.frame is None:
             self.pending_capture = self.menu, workflow
             self.status.set("Camera starting. Conversion will begin when the preview is ready.")
@@ -521,9 +646,14 @@ class PaperWorkbench:
                     if figure is not None:
                         notes = (*notes, f"Plotted over x = {domain[0]:g} to {domain[1]:g}.")
                 draft = Draft(source, content, notes, ".txt")
-            elif workflow in ("table", "diagram"):
-                source, notes = _read_tracked(self, selected, target, language, workflow, self.args.model)
-                draft = Draft(source, source, notes, ".tex" if workflow == "table" else ".txt")
+            elif workflow in ("table", "diagram", "flow", "gantt", "forge_issue", "forge_request"):
+                if recorded or workflow in ("table", "diagram"):
+                    source, notes = _read_tracked(self, selected, target, language, workflow, self.args.model)
+                else:
+                    source, notes = read_still(selected.page.image, target, language, workflow, self.args.model,
+                                               evidence=selected.evidence)
+                draft = Draft(source, source, notes,
+                              {"table": ".tex", "flow": ".md", "gantt": ".md"}.get(workflow, ".txt"))
             elif workflow == "graph":
                 if isinstance(selected, str):
                     source, notes = selected, ()
@@ -552,6 +682,16 @@ class PaperWorkbench:
             else:
                 draft = convert_page(selected.page.image, target, language, self.args.model, workflow,
                                      evidence=selected.evidence)
+            if workflow in ("default", "equation") and draft.source and target in ("VS Code", "MATLAB", "LaTeX"):
+                checks = check_derivation(draft.source)
+                if checks:
+                    draft = replace(draft, notes=(*draft.notes, *checks))
+            if (workflow == "default" and target in ("VS Code", "MATLAB") and draft.content and not draft.files
+                    and draft.source):
+                # The handwriting goes in as a comment, so the editor's inline AI sees what was meant.
+                mark = "%" if target == "MATLAB" else "#" if draft.extension == ".py" else "//"
+                header = "\n".join(f"{mark} {line}" for line in ["From paper:", *draft.source.splitlines()][:14])
+                draft = replace(draft, content=f"{header}\n\n{draft.content}")
             self.results.put((draft, figure, workflow))
         except (OSError, RuntimeError, ValueError, cv2.error) as error:
             self.results.put(error)
@@ -600,6 +740,8 @@ class PaperWorkbench:
         self.open_path(path)
 
     def open_path(self, path):
+        if getattr(self, "project_of", None) is not None:
+            self.project_of[self.menu] = path
         try:
             if self.target == "KiCad":
                 program_files = Path(os.environ.get("ProgramFiles", "C:/Program Files"))
@@ -608,6 +750,8 @@ class PaperWorkbench:
                 if not editor:
                     raise OSError("KiCad was not found. Install KiCad or open the saved .sch on another PC.")
                 subprocess.Popen([str(editor), str(path)])
+            elif self.target == "LTspice":
+                paper_ltspice.open_ltspice(path)
             elif self.target == "MATLAB":
                 path = open_matlab(path)
             elif self.target == "LaTeX" and path.is_dir() and (path / "main.tex").is_file():
@@ -630,6 +774,48 @@ class PaperWorkbench:
         if self.target == "LaTeX" and self.saved.is_dir():
             self.report_folder = self.saved
         self.open_path(self.saved)
+
+    def open_circuit(self):
+        """Save the generated schematic under drafts and open it in LTspice."""
+        try:
+            self.saved = write_new_file(ROOT / "drafts" / "ltspice", "paper_circuit" + self.draft.extension,
+                                        self.result.get("1.0", "end-1c").rstrip() + "\n")
+        except OSError as error:
+            self.status.set(f"Could not save the schematic: {error}")
+            return
+        if self.open_path(self.saved):
+            self.status.set(f"Opened {self.saved.name} in LTspice. Press Simulate to run it.")
+
+    def simulate(self):
+        """Run the current schematic or netlist in LTspice and report what the log says."""
+        if self.busy:
+            return
+        path = self.saved if self.saved and self.saved.suffix.lower() in (".asc", ".cir", ".net") else None
+        if path is None:
+            if not self.draft or not self.result.get("1.0", "end-1c").strip():
+                self.status.set("Draw a circuit and press Schematic first, or paste a netlist.")
+                return
+            try:
+                path = write_new_file(ROOT / "drafts" / "ltspice", "paper_circuit" + self.draft.extension,
+                                      self.result.get("1.0", "end-1c").rstrip() + "\n")
+            except OSError as error:
+                self.status.set(f"Could not save the schematic: {error}")
+                return
+        self.busy = True
+        self.workflow = "ltspice_sim"
+        self.status.set(f"Simulating {path.name} in LTspice...")
+        Thread(target=self._simulate, args=(path, self.draft), daemon=True).start()
+
+    def _simulate(self, path, draft):
+        try:
+            ok, lines = paper_ltspice.simulate(path)
+            if ok:
+                paper_ltspice.open_ltspice(path, run=True)
+        except OSError as error:
+            self.results.put(error)
+            return
+        self.simulated = path, ok, lines
+        self.results.put((draft, None, "ltspice_sim"))
 
     def copy(self, text):
         self.paper_clipboard = None
@@ -744,6 +930,8 @@ class PaperWorkbench:
             self.status.set("Copy text or a figure from the source app first.")
             return
         extension = LANGUAGES[self.language] if self.target == "VS Code" else DIRECT_TARGETS[self.target]
+        if self.target == "LTspice":
+            extension = ".cir"  # Pasted text is a SPICE netlist; drawn circuits are .asc schematics.
         if self.target == "ChatGPT":
             text = "Help me review and develop this material. Flag any assumptions or missing context.\n\n" + (
                 fenced_code(text))
@@ -758,8 +946,7 @@ class PaperWorkbench:
             self.paste_git(clip)
             return
         if self.target == "LaTeX" and clip.kind in ("plot", "diagram") and clip.image() is not None:
-            self.stage_figure(clip.image())
-            self.status.set(f"Pasted {copied} as a figure. " + self.status.get())
+            self.paste_figure_with_source(clip, copied)
             return
         rendering = paper_clipboard.render(clip, self.target, self.language)
         message = f"Pasted {copied} as {rendering.description}"
@@ -780,6 +967,39 @@ class PaperWorkbench:
         self.saved = path
         opened = self.open_path(path)
         self.status.set(f"{message}: {path.name}" + (" (opened)." if opened else f". {self.status.get()}"))
+
+    def paste_figure_with_source(self, clip, copied):
+        """Paste a copied plot into the LaTeX project as what it was made from plus the figure.
+
+        A plot generated from a handwritten equation carries that equation, and one made from
+        code carries the code. Both go into the text in one fragment: the equation (or a code
+        listing) followed by the figure, whose file is copied into ``figures/``. A figure
+        without such a source is inserted on its own.
+        """
+        project = self.active_report()
+        if project is None:
+            return
+        figure = import_figure(clip.image(), project)
+        content, packages, parts = clip.content.strip(), ["graphicx"], ["the figure"]
+        is_path = "\n" not in content and Path(content.strip('"')).suffix.lower() in (".pdf", ".png", ".jpg", ".jpeg")
+        text = ""
+        if content and not is_path and clip.kind == "plot":
+            from paper_context import check_code, check_equation
+
+            if check_equation(content) is None:
+                text = "\\begin{equation}\n  " + paper_clipboard.equation_body(content) + "\n\\end{equation}"
+                parts.insert(0, "the equation")
+            elif clip.source_app in ("VS Code", "MATLAB") and check_code(
+                    content, "MATLAB" if clip.source_app == "MATLAB" else "Python") is None:
+                language = "Matlab" if clip.source_app == "MATLAB" else "Python"
+                body = content.replace("\\end{lstlisting}", "\\end {lstlisting}")
+                text = f"\\begin{{lstlisting}}[language={language}]\n{body}\n\\end{{lstlisting}}"
+                packages.append("listings")
+                parts.insert(0, "the code")
+        fragment = f"{text}\n\n{figure}" if text else figure
+        rendering = paper_clipboard.Rendering(" and ".join(parts), fragment, folder="paperbridge",
+                                              packages=tuple(packages))
+        self.place_latex(rendering, f"Pasted {copied} as {rendering.description}", source=clip.content, ask=False)
 
     def place_latex(self, rendering, message, *, source="", ask=True, name=None):
         """Insert a LaTeX fragment into the selected project, or save a standalone draft if there is none."""
@@ -866,6 +1086,7 @@ class PaperWorkbench:
             self.status.set("Choose a folder containing a .tex project.")
             return None
         self.report_folder = folder
+        self.save_settings()
         self.status.set(f"Selected LaTeX project {folder}")
         return folder
 
@@ -981,35 +1202,197 @@ class PaperWorkbench:
             return
         self.status.set("Opened VS Code Chat with the reviewed transcription.")
 
+    def finish_plan(self, draft):
+        """Schedule the written plan, render the Gantt chart, and open it. Copy then carries the figure."""
+        items, problems = paper_plan.parse_plan(draft.source)
+        if len(items) < 2:
+            self.status.set("No plan read. Write one task per line with a duration, such as 'Prototype 3w'.")
+            self.key_result = ("error", time.monotonic())
+            return
+        problems += paper_plan.schedule(items)
+        fence = "`" * 3
+        document = (f"# Project plan\n\n{paper_plan.summary(items)}\n\n{fence}mermaid\n"
+                    f"{paper_plan.mermaid(items)}\n{fence}\n")
+        try:
+            path = write_new_file(ROOT / "drafts" / "plan", "project_plan.md", document)
+            chart = paper_plan.render(items, path.with_name("gantt.png"))
+        except (OSError, ValueError) as error:
+            self.status.set(f"Could not save the plan: {error}")
+            return
+        self.show_draft(Draft(draft.source, document, (*draft.notes, *problems), ".md"))
+        self.saved, self.figure = path, chart.with_suffix(".pdf")
+        self.plot_preview.pack(side="left", padx=4)
+        try:
+            os.startfile(chart)
+            open_code(path)
+        except OSError:
+            pass
+        self.status.set(f"Gantt chart ready: {paper_plan.summary(items)}. Copy takes the chart, for example into "
+                        "LaTeX as a figure; the Mermaid source is open in VS Code.")
+
+    def finish_flow(self, draft):
+        """Save the drawn flowchart as a Mermaid block, open it in VS Code, and copy it as a typed diagram."""
+        if not draft.source:
+            self.status.set("No flowchart read. Draw the boxes a little larger with clear arrows.")
+            return
+        fence = "`" * 3
+        document = f"# Flowchart from paper\n\n{fence}mermaid\n{draft.source.strip()}\n{fence}\n"
+        try:
+            path = write_new_file(ROOT / "drafts" / "chatgpt", "flowchart.md", document)
+        except OSError as error:
+            self.status.set(f"Could not save the flowchart: {error}")
+            return
+        self.show_draft(Draft(draft.source, document, draft.notes, ".md"))
+        self.saved = path
+        self.copy_clip(paper_clipboard.Clip("diagram", document, self.target or ""))
+        try:
+            open_code(path)
+            self.status.set(f"Flowchart saved as Mermaid in {path.name}, opened in VS Code and copied. Paste it "
+                            "into ChatGPT or a Markdown file.")
+        except OSError as error:
+            self.status.set(f"Flowchart saved as {path} and copied. Could not open VS Code: {error}")
+
+    def finish_forge(self, draft, workflow):
+        repo = self.git_repo
+        if repo is None:
+            return
+        try:
+            kind = paper_forge.kind_of(repo)
+        except (OSError, paper_git.GitError) as error:
+            self.status.set(str(error))
+            return
+        if not draft.source:
+            self.status.set("The writing was unclear. Write it again a little larger.")
+            return
+        try:
+            if workflow == "forge_issue":
+                webbrowser.open(paper_forge.issue_url(repo, kind, draft.source))
+                self.status.set(f"Issue \"{paper_forge.split_text(draft.source)[0]}\" is filled in on "
+                                f"{paper_forge.HOSTS[kind]}. Submit it in the browser.")
+                return
+            url = paper_forge.request_url(repo, kind, draft.source)
+        except (OSError, paper_git.GitError) as error:
+            self.status.set(str(error))
+            self.key_result = ("error", time.monotonic())
+            return
+        self.busy = True
+        self.workflow = "git_push"
+        self.status.set(f"Pushing {repo.name} before opening the request...")
+        Thread(target=self._forge_request, args=(repo, kind, url, draft.source), daemon=True).start()
+
+    def _forge_request(self, repo, kind, url, text):
+        name = "pull request" if kind == "github" else "merge request"
+        try:
+            paper_git.push(repo)
+            webbrowser.open(url)
+            message = (f"Pushed {paper_git.current_branch(repo)} and filled in the {name} "
+                       f"\"{paper_forge.split_text(text)[0]}\". Submit it in the browser.")
+            self.results.put((Draft(text, text, (message,), ".txt"), None, "git_push"))
+        except (OSError, paper_git.GitError) as error:
+            self.results.put(paper_git.GitError(f"The {name} was not opened: {error}"))
+
     def git_dispatch(self, action):
+        """Version control for the project being worked on (see active_repo)."""
         if action == "camera":
             self.toggle_camera()
         elif action == "paste":
             self.paste()
+        elif action in ("remote", "back"):
+            self.select("git_remote" if action == "remote" else "git")
         elif action in ("browse", "open"):
             repo = self.choose_repo() if action == "browse" else self.active_repo()
             if repo is not None:
                 try:
                     open_code(repo)
-                    self.status.set(f"Opened {repo} in VS Code.")
+                    self.status.set(f"Version control now uses {repo.name}; opened it in VS Code.")
                 except OSError as error:
                     self.status.set(str(error))
-        elif action == "push":
+        elif action == "commit":
+            repo = self.active_repo()
+            if repo is None:
+                return
+            # The message is typed: a console opens in the repository, shows the changes, and asks for it.
+            python = Path(sys.executable).with_name("python.exe")
+            try:
+                subprocess.Popen([str(python if python.is_file() else sys.executable),
+                                  str(Path(__file__).with_name("paper_commit.py")), str(repo)], cwd=repo,
+                                 creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0))
+                self.status.set(f"Commit prompt opened for {repo.name}. Type the message in the terminal.")
+                self.key_result = ("done", time.monotonic())
+            except OSError as error:
+                self.status.set(f"Could not open the commit prompt: {error}")
+                self.key_result = ("error", time.monotonic())
+        elif action in ("push", "pull"):
             repo = self.active_repo()
             if repo is not None:
                 self.busy = True
                 self.workflow = "git_push"
-                self.status.set(f"Pushing {repo.name}...")
-                Thread(target=self._git_push, args=(repo,), daemon=True).start()
-        elif action in paper_git.WORKFLOWS:
-            if action != "repo" and self.active_repo() is None:
-                return
+                self.status.set(f"{'Pushing' if action == 'push' else 'Pulling'} {repo.name}...")
+                Thread(target=self._git_push if action == "push" else self._git_pull, args=(repo,),
+                       daemon=True).start()
+        elif action in ("issue", "request", "web", "publish"):
+            self.forge_action(action)
+        elif action in ("repo", "branch", "diagram"):
+            if action != "repo":
+                repo = self.active_repo()
+                if repo is None:
+                    return
             self.writing_action(paper_git.WORKFLOWS[action])
-            if action == "commit" and self.writing_workflow == "git_commit":
-                self.status.set(self.status.get() + " Draw a circle after the message to finish.")
-            elif action == "diagram" and self.writing_workflow == "diagram":
+            if action == "diagram" and self.writing_workflow == "diagram":
                 self.status.set("Draw branches as horizontal lines, circle commits and write their message beside "
                                 "them, circle a branch name to push. Press Diagram again when done.")
+            elif action == "branch" and self.writing_workflow == "git_branch":
+                self.status.set(f"Write the branch name for {repo.name}, then draw a small circle to finish.")
+
+    def forge_action(self, action):
+        """GitHub or GitLab, whichever the project's remote is: issue, request, publish, and the web page."""
+        repo = self.active_repo()
+        if repo is None:
+            return
+        try:
+            if action == "publish":
+                if paper_git.run(repo, "remote").split():
+                    self.status.set(f"{repo.name} already has a remote. Use Push.")
+                    return
+                try:
+                    copied = self.window.clipboard_get().strip()
+                except tk.TclError:
+                    copied = ""
+                parsed = paper_forge.parse_remote(copied) if len(copied) < 300 else None
+                kind = next((kind for kind in paper_forge.HOSTS if parsed and kind in parsed[0]), None)
+                if kind is not None:
+                    paper_forge.connect(repo, kind, copied)
+                    self.busy = True
+                    self.workflow = "git_push"
+                    self.status.set(f"Connected {repo.name} to {parsed[1]}. Pushing...")
+                    Thread(target=self._git_push, args=(repo,), daemon=True).start()
+                else:
+                    webbrowser.open(paper_forge.new_repository_url(repo, "github"))
+                    self.status.set(f"Create the repository for {repo.name} in the browser (GitHub is open; use "
+                                    "GitLab if you prefer), copy its URL, then press Publish again.")
+                return
+            kind = paper_forge.kind_of(repo)
+            if action == "web":
+                webbrowser.open(paper_forge.web_url(repo, kind))
+                self.status.set(f"Opened {repo.name} on {paper_forge.HOSTS[kind]}.")
+                return
+        except (OSError, paper_git.GitError) as error:
+            self.status.set(str(error))
+            self.key_result = ("error", time.monotonic())
+            return
+        self.writing_action("forge_issue" if action == "issue" else "forge_request")
+        if self.writing_workflow:
+            what = "issue" if action == "issue" else "pull request" if kind == "github" else "merge request"
+            self.status.set(f"Write the {what} title for {repo.name} on {paper_forge.HOSTS[kind]}, then draw a "
+                            "small circle to finish.")
+
+    def _git_pull(self, repo):
+        try:
+            branch = paper_git.pull(repo)
+            self.results.put((Draft("", "", (f"Pulled {repo.name} ({branch}) up to date.",), ".txt"), None,
+                              "git_push"))
+        except (OSError, paper_git.GitError) as error:
+            self.results.put(paper_git.GitError(f"Pull not done: {error}"))
 
     def run_git_diagram(self, text):
         """Show the plan from a drawn branch diagram, then run it in the background. The key press is the
@@ -1049,12 +1432,31 @@ class PaperWorkbench:
         if repo is None:
             self.status.set(f"{choice} is not inside a git repository.")
             return None
-        self.git_repo = repo
+        self.git_repo = self.repo_pin = repo
+        self.save_settings()
         self.status.set(f"Selected repository {repo}")
         return repo
 
     def active_repo(self):
-        return self.git_repo if self.git_repo and self.git_repo.is_dir() else self.choose_repo()
+        """The repository of the project being worked on: the one picked with Browse, else the
+        project of the app page used last (for VS Code, its most recently used window), else
+        the last repository used. Only when none of these exists does it ask."""
+        repo = self.repo_pin if self.repo_pin and self.repo_pin.is_dir() else None
+        if repo is None:
+            app = self.menu if self.menu not in ("home", "git", "git_remote") else self.last_app
+            try:
+                folder = paper_project.current_folder(app, self.project_of.get(app), self.report_folder)
+                repo = paper_git.repository_root(folder) if folder else None
+            except OSError:
+                repo = None
+        if repo is None and self.git_repo and self.git_repo.is_dir():
+            repo = self.git_repo
+        if repo is None:
+            return self.choose_repo()
+        if repo != self.git_repo:
+            self.git_repo = repo
+            self.save_settings()
+        return repo
 
     def finish_git(self, draft, workflow):
         try:
@@ -1071,6 +1473,7 @@ class PaperWorkbench:
                 folder = save_generated(draft, self.language, ROOT / "repos")
                 paper_git.init_repository(folder, "Initial scaffold from a handwritten idea")
                 self.git_repo = folder
+                self.save_settings()
                 open_code(folder)
                 self.status.set(f"Created repository {folder} with an initial commit and opened it in VS Code.")
             elif workflow == "git_branch":
@@ -1138,6 +1541,7 @@ class PaperWorkbench:
             pass
         else:
             self.busy = False
+            self.key_result = ("error" if isinstance(result, Exception) else "done", now)
             if isinstance(result, Exception):
                 self.status.set(str(result))
             else:
@@ -1150,6 +1554,20 @@ class PaperWorkbench:
                     self.finish_copy(draft, figure)
                 elif workflow == "table":
                     self.finish_table(draft)
+                elif workflow == "flow":
+                    self.finish_flow(draft)
+                elif workflow == "gantt":
+                    self.finish_plan(draft)
+                elif workflow in ("forge_issue", "forge_request"):
+                    self.finish_forge(draft, workflow)
+                elif workflow == "ltspice_sim":
+                    path, ok, lines = self.simulated
+                    self.saved = path
+                    self.notes.configure(text="\n".join(lines))
+                    self.status.set(f"Simulation finished; {path.name} is open in LTspice with its waveforms."
+                                    if ok else "LTspice reported a problem: " + " | ".join(lines[:3]))
+                elif draft.content and self.target == "LTspice":
+                    self.open_circuit()
                 elif figure:
                     self.plot_preview.pack(side="left", padx=4)
                     self.status.set("Plot ready. Use Copy to transfer it to LaTeX.")
@@ -1160,12 +1578,18 @@ class PaperWorkbench:
                     self.status.set("Review the draft before saving." if draft.content
                                     else "The page was unclear. Try a closer, well-lit image.")
             if not isinstance(result, Exception) and getattr(self, "reading_path", None):
-                label = {"trace": "read from the pen trace", "visual": "read from the photo (trace fallback)"}
+                label = {"trace": "read from the pen trace",
+                         "trace+photo": "read from the pen trace, checked against the photo", "visual": "read from the photo (trace fallback)"}
                 self.status.set(f"{self.status.get()} [{label.get(self.reading_path, self.reading_path)}]")
                 self.reading_path = None
+            if not isinstance(result, Exception) and not draft.content and not draft.source and workflow not in (
+                    "git_push", "git_diagram_run", "ltspice_sim"):
+                self.key_result = ("error", now)  # Nothing was read: show it on the key.
             if self.pending_action is not None:
                 self.window.after_idle(partial(self.dispatch, *self.pending_action))
                 self.pending_action = None
+        if self.key_status() != self.key_state:
+            self.publish()
         self.window.after(65, self.tick)
 
     def convert_after_start(self):
@@ -1195,6 +1619,7 @@ def main():
     parser.add_argument("--image", type=Path, help="Open an existing photo")
     parser.add_argument("--route", choices=[key for key, _ in MENUS["home"]], help=argparse.SUPPRESS)
     parser.add_argument("--slot", type=int, choices=range(9), help=argparse.SUPPRESS)
+    parser.add_argument("--background", action="store_true", help="Start minimized; results show as pop-ups")
     args = parser.parse_args()
     active = current_state()
     if active:
@@ -1207,6 +1632,8 @@ def main():
         return
     window = tk.Tk()
     app = PaperWorkbench(window, args)
+    if args.background:
+        window.iconify()
     if args.route:
         app.select(args.route)
     if args.image:

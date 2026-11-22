@@ -155,6 +155,14 @@ def push(repo, timeout=120, branch=None):
     return branch
 
 
+def pull(repo, timeout=120):
+    """Fast-forward the current branch from its upstream. Never merges or rebases on its own."""
+    if not run(repo, "remote").split():
+        raise GitError("This repository has no remote to pull from.")
+    run(repo, "pull", "--ff-only", timeout=timeout)
+    return current_branch(repo)
+
+
 def commit_file(repo, relative, message, body=""):
     """Commit only one file (added if new), leaving every other change untouched."""
     message = commit_message(message)

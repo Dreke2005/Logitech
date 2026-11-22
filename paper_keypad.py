@@ -55,10 +55,13 @@ class KeypadSession:
         self._worker = None
         COMMANDS.mkdir(parents=True, exist_ok=True)
 
-    def publish(self, labels, menu="home", camera_active=False):
+    def publish(self, labels, menu="home", camera_active=False, active=None, status=None, active_menu=None):
+        """``active`` is the key the workbench is working on and ``status`` its state
+        (recording, busy, done, error); the keypad draws it as a coloured bar on that key."""
         with self._state_lock:
             self._state = {"session": self.id, "revision": self.revision, "labels": labels,
-                           "menu": menu, "cameraActive": camera_active}
+                           "menu": menu, "cameraActive": camera_active, "active": active, "status": status,
+                           "activeMenu": active_menu}
             self._refresh()
 
     def _refresh(self):

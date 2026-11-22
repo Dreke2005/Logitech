@@ -169,7 +169,7 @@ class WorkbenchPasteTests(unittest.TestCase):
                         show_draft=shown.append, copy=copied.append, choose_report=lambda: None)
         bench = SimpleNamespace(**{**defaults, **values})
         for name in ("paste_clip", "place_latex", "open_path", "finish_table", "finish_copy", "copy_clip",
-                     "draft_clip"):
+                     "draft_clip", "paste_figure_with_source", "active_report"):
             setattr(bench, name, partial(getattr(paper_workbench.PaperWorkbench, name), bench))
         return bench
 
@@ -220,14 +220,24 @@ class WorkbenchPasteTests(unittest.TestCase):
         figure = self.folder / "plot.png"
         figure.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 16)
         bench = self.bench("LaTeX", "latex", report_folder=project)
-        bench.stage_figure = lambda path: bench.statuses.append(f"staged {path.name}")
         with patch.object(paper_workbench, "open_code"):
             bench.paste_clip(Clip("equation", r"y = \frac{1}{x}", "MATLAB"))
-            bench.paste_clip(Clip("plot", "y = x", "MATLAB", files=[figure]))
-        fragment, = (project / "paperbridge").glob("equation-*.tex")
+            status = bench.statuses[-1]
+            bench.paste_clip(Clip("plot", "y = x^2", "MATLAB", files=[figure]))
+            bench.paste_clip(Clip("plot", str(figure), "MATLAB", files=[figure]))
+        fragment, = (path for path in (project / "paperbridge").iterdir()
+                     if "includegraphics" not in path.read_text(encoding="utf-8"))
         self.assertEqual(fragment.read_text(encoding="utf-8"), "\\begin{equation}\n  y = \\frac{1}{x}\n\\end{equation}\n")
-        self.assertIn("Pasted equation from MATLAB as an equation environment", bench.statuses[-3])
-        self.assertTrue(bench.statuses[-1].startswith("Pasted plot from MATLAB as a figure. staged plot.png"))
+        self.assertIn("Pasted equation from MATLAB as an equation environment", status)
+        # A plot made from an equation is pasted as both: the equation in the text and the figure file.
+        self.assertEqual(len(list((project / "figures").glob("paper-*.png"))), 2)
+        both = next(text for text in (path.read_text(encoding="utf-8") for path in (project / "paperbridge").iterdir())
+                    if "includegraphics" in text and "begin{equation}" in text)
+        self.assertLess(both.index("begin{equation}"), both.index("includegraphics"))
+        self.assertIn("Pasted plot from MATLAB as the figure", bench.statuses[-1])
+        main = (project / "main.tex").read_text(encoding="utf-8")
+        self.assertIn("graphicx", main)
+        self.assertEqual(main.count("\\input{paperbridge/"), 3)
 
     def test_vscode_and_matlab_paste_create_and_open_files(self):
         import paper_workbench
@@ -290,7 +300,7 @@ class WorkbenchPasteTests(unittest.TestCase):
                     "diagram": "branch x from main"}
         with patch.object(paper_workbench, "ROOT", self.folder), \
                 patch.object(paper_workbench, "read_recording",
-                             side_effect=lambda _s, _t, _l, workflow, _m: (readings[workflow], ())) as reader:
+                             side_effect=lambda _s, _t, _l, workflow, _m, hints=(): (readings[workflow], ())) as reader:
             for workflow, target in (("copy", "MATLAB"), ("table", "LaTeX"), ("diagram", "Git")):
                 paper_workbench.PaperWorkbench._generate(bench, object(), target, "Python", workflow, True)
                 draft, figure, done = bench.results.get_nowait()

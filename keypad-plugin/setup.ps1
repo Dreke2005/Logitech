@@ -24,11 +24,14 @@ $launcher = @{ python = $python; script = $entry } | ConvertTo-Json -Compress
 Set-Content -LiteralPath (Join-Path $data "launcher.json") -Value $launcher -Encoding utf8
 $package = (Resolve-Path (Join-Path $PSScriptRoot "bin\Release")).Path
 
-# Icon-only key templates: one full-screen image item and no title item for every PaperBridge action.
+# Icon-only templates for the app folder actions: one full-screen image item and no title item.
 $templates = Join-Path $package "icontemplates"
 $null = New-Item -ItemType Directory -Force $templates
-$folders = @{ VsCode = "vscode"; Matlab = "matlab"; Latex = "latex"; ChatGpt = "chatgpt"; KiCad = "kicad"; Git = "git" }
-$actions = @{ "Loupedeck.PaperDeskPlugin.PaperKey" = "" }
+$folders = @{ VsCode = "vscode"; Matlab = "matlab"; Latex = "latex"; ChatGpt = "chatgpt"; KiCad = "kicad"; LtSpice = "ltspice"; Git = "git"; Plan = "plan" }
+# The nine paper keys draw their own image for the current menu. A template for them would
+# replace that image with the template's empty one, so they get none.
+Remove-Item -LiteralPath (Join-Path $templates "Loupedeck.PaperDeskPlugin.PaperKey.ict") -ErrorAction SilentlyContinue
+$actions = @{}
 foreach ($name in $folders.Keys) {
     $icon = Join-Path $PSScriptRoot "icons\$($folders[$name]).png"
     $actions["Loupedeck.PaperDeskPlugin.${name}PaperFolder"] = [Convert]::ToBase64String([IO.File]::ReadAllBytes($icon))
@@ -46,6 +49,9 @@ foreach ($action in $actions.Keys) {
     $json = $template | ConvertTo-Json -Depth 5
     [IO.File]::WriteAllText((Join-Path $templates "$action.ict"), $json)
 }
+
+# A service that was stopped while loading leaves a crash marker that disables the plugin on the next start.
+Remove-Item -LiteralPath (Join-Path $env:LOCALAPPDATA "Logi\LogiPluginService\Logs\plugin_crashes\PaperDeskPlugin.dll") -ErrorAction SilentlyContinue
 
 $link = Join-Path $plugins "PaperDeskPlugin.link"
 Set-Content -LiteralPath $link -Value "$package\" -Encoding utf8

@@ -499,6 +499,9 @@ class WritingSession:
             strokes, trace_bounds = [], None
         rotation = self._rotation(side)
         ink = self._new_ink(frame) if path else None
+        if strokes and ink is not None:
+            strokes = self._match_ink(strokes, ink)
+            trace_bounds = stroke_bounds(strokes)
         if roi is not None:
             bounds, text_height = roi, self._text_height(strokes, rotation)
         else:
@@ -519,6 +522,68 @@ class WritingSession:
                 evidence = cv2.cvtColor(np.where(local != 0, 0, 255).astype(np.uint8), cv2.COLOR_GRAY2BGR)
         return WritingSelection(chosen, evidence, trace, reliable, self.end_marked,
                                 tuple(np.asarray(stroke, np.int32) for stroke in strokes), rotation, text_height)
+
+    def _match_ink(self, strokes, ink):
+        """Register the pen trace on the visible new ink, then cut out moves that left no ink.
+
+        The tip landmark sits a few pixels off the nib, so the pen-down test has to accept
+        ink anywhere within the ink radius. With small handwriting that also accepts a
+        hover hop to the next letter, which joins glyphs in the trace. Here the whole trace
+        is first shifted onto the ink (one offset for the recording), and each segment is
+        then checked against the ink with a tight tolerance. Points still under the hand
+        cannot be judged and are kept. A faint or missing ink map leaves the trace as is.
+        """
+        height, width = ink.shape
+        if np.count_nonzero(ink) < 30:
+            return strokes
+        distance = cv2.distanceTransform((ink == 0).astype(np.uint8), cv2.DIST_L2, 3)
+        hidden = self._occlusion_mask(ink.shape, (0, 0), grow=1.8) != 0
+        tolerance = max(2.5, 0.35 * self.ink_radius)
+        reach = int(self.ink_radius)
+
+        def lookup(points):
+            xs = np.clip(np.rint(points[:, 0]).astype(int), 0, width - 1)
+            ys = np.clip(np.rint(points[:, 1]).astype(int), 0, height - 1)
+            return distance[ys, xs], hidden[ys, xs]
+
+        points = np.vstack([np.asarray(stroke, float) for stroke in strokes])
+        best, offset = None, np.zeros(2)
+        for dy in range(-reach, reach + 1, 2):
+            for dx in range(-reach, reach + 1, 2):
+                gaps, covered = lookup(points + (dx, dy))
+                if np.count_nonzero(~covered) < 8:
+                    continue
+                # Prefer the smallest shift among equally good fits.
+                score = float(np.mean(np.minimum(gaps[~covered], 2.0 * reach))) + 0.02 * np.hypot(dx, dy)
+                if best is None or score < best:
+                    best, offset = score, np.array((dx, dy), float)
+        if best is None:
+            return strokes
+        gaps, covered = lookup(points + offset)
+        if np.mean(gaps[~covered] <= tolerance) < 0.5:
+            return strokes  # The ink map does not explain the trace; do not let it cut strokes.
+        result = []
+        for stroke in strokes:
+            moved = np.asarray(stroke, float) + offset
+            pieces = [[moved[0]]]
+            for start, end in zip(moved, moved[1:]):
+                length = float(np.linalg.norm(end - start))
+                if length > tolerance:
+                    steps = max(2, int(np.ceil(length / 2.0)) + 1)
+                    along = start + (end - start) * np.linspace(0, 1, steps)[:, None]
+                    gaps, covered = lookup(along)
+                    judged = ~covered
+                    if np.count_nonzero(judged) >= 2 and np.mean(gaps[judged] > tolerance) > 0.5:
+                        pieces.append([])  # Mostly clean paper under this move: the pen was up.
+                pieces[-1].append(end)
+            for piece in pieces:
+                piece = np.asarray(piece, float)
+                gaps, covered = lookup(piece)
+                on_ink = np.flatnonzero(covered | (gaps <= tolerance))
+                if len(on_ink) >= 2:  # Trim hover samples at both ends of the piece.
+                    piece = piece[on_ink[0]:on_ink[-1] + 1]
+                    result.append([tuple(int(v) for v in np.rint(point)) for point in piece])
+        return result or strokes
 
     def _rotation(self, side):
         """Clockwise turn that makes the writing upright for the writer.

@@ -484,6 +484,37 @@ class TightCropTests(unittest.TestCase):
         selected = session.select(page, prefer_recent=True)
         self.assertEqual(selected.rotation, 180)
 
+    def test_hover_hop_between_close_glyphs_is_cut_out_of_the_trace(self):
+        """A hop to the next glyph that stays within the ink radius of both glyphs is not a stroke."""
+        page = np.full((480, 640, 3), 245, dtype=np.uint8)
+        session = WritingSession(page)
+        first, second = line((200, 220), (200, 250)), line((214, 220), (214, 250))
+        cv2.polylines(page, [np.asarray(first, np.int32)], False, INK, 2, cv2.LINE_AA)
+        cv2.polylines(page, [np.asarray(second, np.int32)], False, INK, 2, cv2.LINE_AA)
+        joined = [first + line((200, 250), (214, 220), 5)[1:-1] + second]
+        ink = session._new_ink(page)
+        strokes = session._match_ink(joined, ink)
+        self.assertEqual(len(strokes), 2)
+        self.assertTrue(all(abs(x - 200) <= 5 for x, _ in strokes[0]))
+        self.assertTrue(all(abs(x - 214) <= 5 for x, _ in strokes[1]))
+
+    def test_trace_offset_from_the_nib_is_registered_on_the_ink(self):
+        page = np.full((480, 640, 3), 245, dtype=np.uint8)
+        session = WritingSession(page)
+        strokes = glyph_strokes(200)
+        for stroke in strokes:
+            cv2.polylines(page, [np.asarray(stroke, np.int32)], False, INK, 2, cv2.LINE_AA)
+        shifted = [[(x + 3, y - 2) for x, y in stroke] for stroke in strokes]
+        matched = session._match_ink(shifted, session._new_ink(page))
+        self.assertEqual(len(matched), len(strokes))
+        error = np.abs(np.asarray(matched[0], float) - np.asarray(strokes[0], float)).max()
+        self.assertLessEqual(error, 1.5)
+
+    def test_missing_ink_map_leaves_the_trace_alone(self):
+        session = WritingSession(np.full((480, 640, 3), 245, dtype=np.uint8))
+        strokes = glyph_strokes(200)
+        self.assertEqual(session._match_ink(strokes, np.zeros((480, 640), np.uint8)), strokes)
+
     def test_end_circle_can_be_disabled_for_diagrams(self):
         strokes = self.strokes + [loop((330, 236), 17)]
         for enabled in (True, False):

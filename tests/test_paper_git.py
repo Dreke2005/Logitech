@@ -136,6 +136,7 @@ class WorkbenchGitTests(GitTestCase):
     def workbench(self, repo=None):
         statuses = []
         return SimpleNamespace(git_repo=repo, language="Python", status=SimpleNamespace(set=statuses.append),
+                               save_settings=lambda: None,
                                statuses=statuses)
 
     def test_repo_from_idea_scaffolds_commits_and_opens_vscode(self):

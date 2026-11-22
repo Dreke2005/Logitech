@@ -14,16 +14,18 @@ from pathlib import Path
 from paper_math import normalize_scalar
 
 APPS = {"vscode": "VS Code", "matlab": "MATLAB", "latex": "LaTeX", "chatgpt": "ChatGPT",
-        "kicad": "KiCad", "git": "Git"}
+        "kicad": "KiCad", "ltspice": "LTspice", "git": "Git", "git_remote": "Git", "plan": "Plan"}
 # Keypad keys (paper_menus.json) that read handwriting, and the workflow each one starts.
 KEY_WORKFLOWS = {"code": "code", "project": "project", "graph": "graph", "equation": "equation",
                  "table": "table", "brief": "brief", "circuit": "circuit", "repo": "repo",
-                 "branch": "branch", "commit": "commit", "diagram": "diagram", "copy": "copy"}
+                 "branch": "branch", "commit": "commit", "diagram": "diagram", "copy": "copy",
+                 "issue": "issue", "request": "request", "flow": "flow", "gantt": "gantt"}
 COPY_KINDS = ("equation", "code", "table", "plot", "diagram", "todo", "text")
 # The selected app is the prior for what a copied mark most likely is.
 COPY_PRIOR = {"MATLAB": ("code", "equation", "plot"), "LaTeX": ("equation", "table"),
               "VS Code": ("code", "equation"), "ChatGPT": ("text", "todo", "code"),
-              "KiCad": ("text", "equation"), "Git": ("diagram", "todo", "text")}
+              "Plan": ("todo", "text", "table"), "KiCad": ("text", "equation"), "LTspice": ("code", "equation", "text"),
+              "Git": ("diagram", "todo", "text")}
 
 
 @dataclass(frozen=True)
@@ -80,6 +82,11 @@ CONTEXTS = {
     ("KiCad", "circuit"): WritingContext(
         "A circuit sketch with component references (R1, C2, L1, D1), values, and net labels.",
         "One component per line: reference, value, and its two net labels.", "text", ("diagram", "text")),
+    ("LTspice", "circuit"): WritingContext(
+        "A circuit sketch to simulate: sources (V1, I1), resistors, capacitors, inductors, and diodes with "
+        "values, net labels, a ground symbol, and possibly a command such as .tran 10m or .ac dec 20 1 1Meg.",
+        "One component per line: reference, value, and its two net labels; then the simulation command.",
+        "text", ("diagram", "text")),
     ("Git", "repo"): WritingContext(
         "A software project idea for a new repository: its title, goals, components, and class names.",
         "The idea as short lines: title first, then goals and components.", "text",
@@ -100,6 +107,27 @@ CONTEXTS = {
         "One command per line, in time order from left to right, using only: branch <name> [from <parent>] | "
         'commit <branch> "<message>" | merge <source> into <target> | push <branch>.',
         "diagram", ("diagram",), end_circle=False),
+    ("*", "issue"): WritingContext(
+        "An issue for a software project: a short title on the first line, then a few lines describing the bug "
+        "or the wanted feature.",
+        "The title on the first line, then the description lines as written. A circle drawn after the text ends "
+        "the recording; leave it out.", "commit", ("text",)),
+    ("*", "request"): WritingContext(
+        "The title of a pull request or merge request, optionally followed by lines describing the change.",
+        "The title on the first line, then the description lines as written. A circle drawn after the text ends "
+        "the recording; leave it out.", "commit", ("text",)),
+    ("ChatGPT", "flow"): WritingContext(
+        "A flowchart or state machine: boxes with labels, diamonds for decisions, and arrows between them, "
+        "some with labels such as yes and no.",
+        "Mermaid flowchart source: the first line 'flowchart TD', then one line per arrow such as "
+        "A[Start] --> B{Valid?} or B -->|yes| C[Save]. Give every box a short id (A, B, C) and keep its label.",
+        "flow", ("diagram",), end_circle=False),
+    ("Plan", "gantt"): WritingContext(
+        "A project plan written while brainstorming: tasks from top to bottom, each with a duration such as "
+        "2w or 3d, arrows meaning 'then', and milestones marked with a star, diamond, or the word milestone.",
+        "One line per item in written order: 'task: <name>, <duration>' or 'milestone: <name>'. Add "
+        "', after <name>' only when an arrow shows it follows an item other than the one above.",
+        "plan", ("outline", "diagram"), end_circle=False),
     ("*", "copy"): WritingContext(
         "A marked item to copy into another app. In {app} it is most likely: {prior}.",
         "First line KIND: <equation|code|table|plot|diagram|todo|text>, then the content: an equation as "
@@ -114,11 +142,11 @@ GENERIC = WritingContext("Handwritten notes.", "The writing transcribed literall
 
 def canonical_workflow(app, workflow):
     """Map the workbench's internal workflow names to the context table's keys."""
-    workflow = (workflow or "default").removeprefix("git_")
+    workflow = (workflow or "default").removeprefix("git_").removeprefix("forge_")
     if workflow == "new":
         workflow = "repo"
     if workflow == "default":
-        return "circuit" if app == "KiCad" else "code"
+        return "circuit" if app in ("KiCad", "LTspice") else "code"
     if workflow == "idea":
         return "brief"
     if workflow in ("matrix", "solve"):
@@ -151,6 +179,59 @@ def writing_context(app, workflow, language=None):
 def end_circle_enabled(workflow, app=None):
     """False where circles are content (branch diagrams, copy marks), so drawing one must not end recording."""
     return writing_context(app, workflow).end_circle
+
+
+HINT_PATTERNS = {
+    ".py": r"^\s*(?:def|class)\s+([A-Za-z_]\w*)|^([A-Za-z_]\w*)\s*=(?!=)",
+    ".m": r"^\s*function\s+(?:[^=\n]*=\s*)?([A-Za-z_]\w*)|^([A-Za-z_]\w*)\s*=(?!=)",
+    ".js": r"\b(?:function|class|const|let)\s+([A-Za-z_$][\w$]*)",
+    ".ts": r"\b(?:function|class|const|let|interface|type)\s+([A-Za-z_$][\w$]*)",
+    ".cpp": r"\b(?:class|struct)\s+([A-Za-z_]\w*)|\b([A-Za-z_]\w*)\s*\([^;{}]*\)\s*\{",
+    ".tex": r"\\(?:newcommand|renewcommand)\{?(\\[A-Za-z]+)|\\label\{([^}]{1,40})\}",
+}
+HINT_SUFFIXES = {"VS Code": (".py", ".js", ".ts", ".cpp"), "MATLAB": (".m",), "LaTeX": (".tex",),
+                 "Git": (".py", ".js", ".ts", ".cpp", ".m")}
+HINT_SUFFIXES["GitHub"] = HINT_SUFFIXES["GitLab"] = HINT_SUFFIXES["Git"]
+
+
+def project_hints(app, folder, limit=30):
+    """Names from the user's open project that are likely to show up in the handwriting.
+
+    Function, class, and variable names for code; macros and labels for LaTeX; branch names
+    for Git. The reader gets them as vocabulary, which narrows ambiguous glyphs.
+    """
+    if not folder:
+        return ()
+    folder = Path(folder)
+    names = {}
+    try:
+        if app in ("Git", "GitHub", "GitLab") and (folder / ".git").exists():
+            for ref in sorted((folder / ".git" / "refs" / "heads").rglob("*")):
+                if ref.is_file():
+                    names.setdefault(ref.relative_to(folder / ".git" / "refs" / "heads").as_posix())
+        files, pending = [], [folder]
+        while pending and len(files) < 40:
+            for path in sorted(pending.pop(0).iterdir()):
+                if path.is_dir():
+                    if not path.name.startswith(".") and path.name not in ("node_modules", "__pycache__", "build"):
+                        pending.append(path)
+                elif path.suffix.lower() in HINT_SUFFIXES.get(app, ()):
+                    files.append(path)
+        for path in files[:40]:
+            if not path.is_file() or path.stat().st_size > 200_000:
+                continue
+            text = path.read_text(encoding="utf-8", errors="ignore")
+            taken = 0  # A few names per file, so one large file does not crowd out the rest.
+            for match in re.finditer(HINT_PATTERNS[path.suffix.lower()], text, re.MULTILINE):
+                name = next((group for group in match.groups() if group), None)
+                if name and 3 <= len(name) <= 40 and not name.startswith("_") and name not in names:
+                    names.setdefault(name)
+                    taken += 1
+                if taken >= 4:
+                    break
+    except OSError:
+        pass
+    return tuple(names)[:limit]
 
 
 # Validators ------------------------------------------------------------------------------
@@ -362,6 +443,26 @@ def check_commit(text):
     return None
 
 
+def check_flow(text):
+    lines = [line.strip() for line in text.strip().splitlines() if line.strip()]
+    if not lines or not re.match(r"(flowchart|graph)\s+(TD|TB|LR|RL|BT)\b", lines[0]):
+        return "the first line must be 'flowchart TD'"
+    arrows = [line for line in lines[1:] if re.search(r"-->|---|-\.->|==>", line)]
+    if not arrows:
+        return "no arrows; write one line per arrow such as A[Start] --> B[End]"
+    for line in lines[1:]:
+        problem = _balance(re.sub(r"-->|==>|-\.->|---|\|[^|]*\|", " ", line))
+        if problem:
+            return f"'{line[:50]}' has unbalanced brackets: {problem}"
+    return None
+
+
+def _check_plan(text):
+    from paper_plan import check_plan
+
+    return check_plan(text)
+
+
 def check_text(text):
     return None if re.search(r"[A-Za-z0-9]", text) else "no readable text"
 
@@ -378,5 +479,6 @@ def validate_reading(app, workflow, text, language=None):
         reason = check_copy(text, context.language)
     else:
         reason = {"equation": check_equation, "plot": check_plot, "table": check_table, "branch": check_branch,
-                  "commit": check_commit, "diagram": check_diagram}.get(check, check_text)(text)
+                  "commit": check_commit, "diagram": check_diagram, "flow": check_flow,
+                  "plan": _check_plan}.get(check, check_text)(text)
     return reason is None, reason or ""

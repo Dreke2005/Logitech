@@ -125,6 +125,39 @@ class PaperConversionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "net labels"):
             build_schematic(parts)
 
+    def test_ltspice_schematic_connects_parts_by_net_flags(self):
+        from paper_ltspice import build_asc, netlist_text
+
+        parts = [{"reference": "V1", "value": "SINE(0 1 1k)", "nets": ["in", "GND"]},
+                 {"reference": "R1", "value": "1k", "nets": ["in", "out"]},
+                 {"reference": "C1", "value": "100n", "nets": ["out", "gnd"]}]
+        schematic = build_asc(parts)
+        self.assertTrue(schematic.startswith("Version 4\nSHEET 1 "))
+        for line in ("SYMBOL voltage", "SYMBOL res", "SYMBOL cap", "SYMATTR InstName C1", "SYMATTR Value 100n",
+                     "!.tran 10m"):
+            self.assertIn(line, schematic)
+        self.assertEqual(sum(line.endswith(" out") for line in schematic.splitlines() if line.startswith("FLAG")), 2)
+        self.assertEqual(sum(line.endswith(" 0") for line in schematic.splitlines() if line.startswith("FLAG")), 2)
+        self.assertIn("!.ac dec 10 1 100k", build_asc(parts, ".ac dec 10 1 100k"))
+        self.assertIn("R1 in out 1k", netlist_text(parts))
+        with self.assertRaisesRegex(ValueError, "ground"):
+            build_asc(parts[1:2])
+        with self.assertRaisesRegex(ValueError, "net labels"):
+            build_asc([{"reference": "R1", "value": "1k", "nets": ["in\nSYMBOL x", "GND"]}])
+
+    def test_circuit_sketch_becomes_an_ltspice_draft(self):
+        frame = np.zeros((40, 60, 3), dtype=np.uint8)
+        reply = {"source": "V1 - R1 - GND", "notes": [], "directive": "", "components": [
+            {"reference": "V1", "value": "5", "nets": ["in", "GND"]},
+            {"reference": "R1", "value": "1k", "nets": ["in", "GND"]}]}
+        with patch("paper_conversion.chat", return_value=reply):
+            result = convert_page(frame, "LTspice", None, "local")
+        self.assertEqual(result.extension, ".asc")
+        self.assertIn("!.op", result.content)
+        self.assertTrue(any("R1 in 0 1k" in note for note in result.notes))
+        with patch("paper_conversion.chat", return_value={**reply, "components": []}):
+            self.assertEqual(convert_page(frame, "LTspice", None, "local").content, "")
+
     def test_uncertain_circuit_has_no_export(self):
         frame = np.zeros((40, 60, 3), dtype=np.uint8)
         reply = {"source": "R1", "components": [], "notes": ["Unclear junction"]}
@@ -285,11 +318,15 @@ class TraceFirstReadingTests(unittest.TestCase):
     def reply(self, source, clear=True):
         return {"source": source, "notes": [], "kind": "equation", "clear": clear}
 
-    def test_trace_success_skips_the_visual_check(self):
+    def test_trace_reading_is_confirmed_by_the_photo_of_the_new_ink(self):
         with patch("paper_conversion.chat", return_value=self.reply("y = x^{2} + 1")) as model:
             reading = read_recording(_recorded(_equation_strokes()), "LaTeX", "Python", "equation", "local")
-        self.assertEqual(model.call_count, 1)
-        self.assertEqual((reading.path, reading[0]), ("trace", "y = x^{2} + 1"))
+        self.assertEqual(model.call_count, 2)
+        self.assertEqual((reading.path, reading[0]), ("trace+photo", "y = x^{2} + 1"))
+        self.assertTrue(any("agrees" in note for note in reading[1]))
+        self.assertIn("evidence", model.call_args_list[1].kwargs)  # Photo crop plus the new-ink map.
+        self.assertIn("'y = x^{2} + 1'", model.call_args_list[1].args[2])
+        model.call_args = model.call_args_list[0]
         self.assertNotIn("evidence", model.call_args.kwargs)  # Only the rendered strokes.
         prompt = model.call_args.args[2]
         self.assertIn("9 pen-down strokes", prompt)
@@ -314,10 +351,31 @@ class TraceFirstReadingTests(unittest.TestCase):
         self.assertTrue(any("pen-trace reading was rejected" in note for note in reading[1]))
 
     def test_retry_with_feedback_can_fix_the_trace_reading(self):
-        with patch("paper_conversion.chat", side_effect=[self.reply("y = = x^2"), self.reply("y = x^2")]) as model:
+        with patch("paper_conversion.chat", side_effect=[self.reply("y = = x^2"), self.reply("y = x^2"),
+                                                          self.reply("y = x^2")]) as model:
             reading = read_recording(_recorded(_equation_strokes()), "LaTeX", "Python", "equation", "local")
-        self.assertEqual(model.call_count, 2)
-        self.assertEqual((reading.path, reading[0]), ("trace", "y = x^2"))
+        self.assertEqual(model.call_count, 3)
+        self.assertEqual((reading.path, reading[0]), ("trace+photo", "y = x^2"))
+
+    def test_photo_corrects_a_symbol_in_a_valid_but_wrong_trace_reading(self):
+        with patch("paper_conversion.chat", side_effect=[self.reply("y = x^{2} + 7"), self.reply("y = x^{2} + 1")]):
+            reading = read_recording(_recorded(_equation_strokes()), "LaTeX", "Python", "equation", "local")
+        self.assertEqual((reading.path, reading[0]), ("trace+photo", "y = x^{2} + 1"))
+        self.assertTrue(any("corrected" in note for note in reading[1]))
+
+    def test_photo_that_reads_something_else_only_flags_the_trace_reading(self):
+        with patch("paper_conversion.chat", side_effect=[self.reply("y = x^{2} + 1"), self.reply("a b c d e f g h")]):
+            reading = read_recording(_recorded(_equation_strokes()), "LaTeX", "Python", "equation", "local")
+        self.assertEqual(reading[0], "y = x^{2} + 1")
+        self.assertTrue(any("Check this reading" in note for note in reading[1]))
+
+    def test_trace_without_photo_evidence_is_read_alone(self):
+        selection = WritingSelection(PaperSelection(np.full((60, 160, 3), 225, np.uint8), None, "full"),
+                                     strokes=tuple(np.asarray(stroke) for stroke in _equation_strokes()),
+                                     text_height=38.0)
+        with patch("paper_conversion.chat", return_value=self.reply("y = x^{2} + 1")) as model:
+            reading = read_recording(selection, "LaTeX", "Python", "equation", "local")
+        self.assertEqual((model.call_count, reading.path), (1, "trace"))
 
     def test_sparse_trace_goes_straight_to_the_photo(self):
         with patch("paper_conversion.chat", return_value=self.reply("y = x^2")) as model:
@@ -347,7 +405,7 @@ class TraceFirstReadingTests(unittest.TestCase):
         # The workbench's internal workflow names resolve to specific contexts too.
         for app, workflow in (("VS Code", "default"), ("MATLAB", "graph"), ("MATLAB", "project"),
                               ("LaTeX", "equation"), ("LaTeX", "project"), ("LaTeX", "table"),
-                              ("ChatGPT", "idea"), ("KiCad", "default"), ("Git", "git_repo"),
+                              ("ChatGPT", "idea"), ("KiCad", "default"), ("LTspice", "default"), ("Git", "git_repo"),
                               ("Git", "git_branch"), ("Git", "git_commit"), ("Git", "diagram"), ("MATLAB", "copy")):
             with self.subTest(app=app, workflow=workflow):
                 context = writing_context(app, workflow, "Python")

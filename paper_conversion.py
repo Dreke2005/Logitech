@@ -1,9 +1,10 @@
 """Turn a captured page into a reviewed math, code, or schematic draft."""
 
 import ast
+import difflib
 import keyword
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import PurePosixPath, PureWindowsPath
 
 import cv2
@@ -11,12 +12,13 @@ import numpy as np
 
 from local_model import ModelOutputLimit, chat
 from paper_context import validate_reading, writing_context
+from paper_ltspice import build_asc, netlist_text
 from paper_math import latex_equation, matlab_literal, python_equation
 from paper_pen import render_trace, rotate_image
 
 LANGUAGES = {"Python": ".py", "PyTorch": ".py", "JavaScript": ".js",
              "TypeScript": ".ts", "C++": ".cpp"}
-DIRECT_TARGETS = {"LaTeX": ".tex", "MATLAB": ".m", "KiCad": ".sch", "ChatGPT": ".md"}
+DIRECT_TARGETS = {"LaTeX": ".tex", "MATLAB": ".m", "KiCad": ".sch", "LTspice": ".asc", "ChatGPT": ".md", "Plan": ".md", "Git": ".txt"}
 SOURCE_SUFFIXES = {
     "Python": {".py"}, "PyTorch": {".py"}, "JavaScript": {".js"},
     "TypeScript": {".ts"}, "C++": {".cpp", ".hpp", ".h"}, "MATLAB": {".m"}, "LaTeX": {".tex"},
@@ -280,18 +282,61 @@ def _read_trace(selection, context, schema, model, feedback=None):
     return source, notes, reply.get("clear") is not False
 
 
-def read_recording(selection, target, language, workflow, model):
-    """Read a recording: the pen trace first, the photo of the new ink only as a fallback.
+def _compact(text):
+    return re.sub(r"\s+", "", text)
+
+
+def _photo_check(selection, context, schema, model, source, target, workflow, language):
+    """Check an accepted trace reading against the tight photo of the new ink.
+
+    A trace with hover lines can give a well-formed but wrong reading that the key's
+    validator accepts. The photo crop of the same writing is the second witness: it
+    confirms the reading, corrects a few symbols, or - when it reads something quite
+    different - leaves the trace reading in place with a note to compare with the page.
+    Returns (source, remark), or None when there is no photo evidence or the check fails.
+    """
+    page, ink = selection.page.image, getattr(selection, "evidence", None)
+    if page is None or ink is None or ink.shape[:2] != page.shape[:2]:
+        return None
+    page, ink = _upright([page, ink], getattr(selection, "rotation", 0), getattr(selection, "text_height", 0.0))
+    request = (f"{context.prompt} The first image is a photo crop of what the user just wrote. The second shows "
+               "only the ink that appeared while writing, at the same scale and position. The recorded pen "
+               f"strokes were read as {source[:600]!r}. Compare that reading with the photo symbol by symbol. "
+               "If the photo agrees, return the reading unchanged in source. Change only symbols that the photo "
+               "clearly shows differently. Do not solve, complete, or explain it.")
+    try:
+        seen, _ = _text_and_notes(chat(model, SYSTEM, request, schema, image=_image_bytes(page, enhance=True),
+                                       evidence=_image_bytes(ink), tokens=800))
+    except (RuntimeError, ValueError):
+        return None
+    if not seen:
+        return None
+    if _compact(seen) == _compact(source):
+        return source, "The photo of the new ink agrees with the pen trace."
+    ok, _ = validate_reading(target, workflow, seen, language)
+    if ok and difflib.SequenceMatcher(None, _compact(source), _compact(seen)).ratio() >= 0.6:
+        return seen, f"The photo corrected the pen-trace reading {source[:120]!r}."
+    return source, f"Check this reading: the photo of the same writing reads {seen[:120]!r}."
+
+
+def read_recording(selection, target, language, workflow, model, hints=()):
+    """Read a recording: the pen trace first, checked against the photo of the new ink.
 
     1. The rendered pen-down strokes alone (clean, upright, tight, ~80 px glyphs) go to the
        model with the key's context. A reading that fails the key's validator is retried
        once with the reason.
+       An accepted trace reading is then compared with the tight photo crop of the new
+       ink (path "trace+photo"); see _photo_check.
     2. Only when the trace is missing or too sparse, or its reading is still invalid, the
        tight photo crop of the new ink is read, with the clean new-ink map (or the trace)
        as a second image.
     Returns a Reading whose ``path`` is "trace" or "visual".
     """
     context = writing_context(target, workflow, language)
+    if hints:
+        # Names from the open project narrow what an ambiguous word or symbol can be.
+        context = replace(context, writing=f"{context.writing} Names that already exist in the user's project "
+                                           f"and may appear in the writing: {', '.join(hints)}.")
     schema = _reading_schema(context.kinds)
     rejected = ()
     strokes = getattr(selection, "strokes", ()) or ()
@@ -304,7 +349,11 @@ def read_recording(selection, target, language, workflow, model):
                 source, notes, clear = "", (), False
             ok, reason = validate_reading(target, workflow, source, language)
             if ok and (clear or source):
-                return Reading(source, (*notes, "Read from the recorded pen strokes."), "trace")
+                checked = _photo_check(selection, context, schema, model, source, target, workflow, language)
+                if checked is None:
+                    return Reading(source, (*notes, "Read from the recorded pen strokes."), "trace")
+                source, remark = checked
+                return Reading(source, (*notes, remark, "Read from the recorded pen strokes."), "trace+photo")
             feedback = (source[:300], reason or "the strokes were unclear")
         rejected = (f"The pen-trace reading was rejected ({feedback[1]}), so the photo was read instead.",)
 
@@ -433,6 +482,79 @@ def build_schematic(parts):
     return "\n".join([*lines, "$EndSCHEMATC", ""])
 
 
+def _dangling_nets(components):
+    """Net names used by exactly one pin (ground excluded)."""
+    counts = {}
+    for part in components if isinstance(components, list) else ():
+        nets = part.get("nets") if isinstance(part, dict) else None
+        for net in nets if isinstance(nets, list) else ():
+            if isinstance(net, str):
+                counts[net.strip()] = counts.get(net.strip(), 0) + 1
+    return [net for net, count in counts.items() if count == 1 and net.lower() not in ("gnd", "0", "ground")]
+
+
+def circuit_draft(image, model):
+    """Read a circuit sketch into an LTspice schematic. The readable netlist goes into the review notes."""
+    part = {
+        "type": "object", "properties": {
+            "reference": {"type": "string", "maxLength": 4},
+            "value": {"type": "string", "maxLength": 40},
+            "nets": {"type": "array", "items": {"type": "string", "maxLength": 20}, "minItems": 2, "maxItems": 2},
+        }, "required": ["reference", "value", "nets"], "additionalProperties": False,
+    }
+    schema = {"type": "object", "properties": {
+        **PROPERTIES, "components": {"type": "array", "items": part, "maxItems": 24},
+        "directive": {"type": "string", "maxLength": 80},
+    }, "required": ["source", "notes", "components", "directive"], "additionalProperties": False}
+    prompt = ("This is a hand-drawn circuit for the LTspice simulator. List the visible connections in source in "
+              "at most four short lines. Extract only clearly visible voltage sources (V1), current sources (I1), "
+              "resistors, capacitors, inductors, and diodes. For each give its reference, its value as written "
+              "(for example 1k, 100n, 5, SINE(0 1 1k), AC 1), and two net names in pin order: for a source the "
+              "positive terminal first, for a diode the anode first. Use the same name for every shared net, "
+              "name unlabelled nets n1, n2, ..., and name the ground node GND. The ground symbol and net labels "
+              "are nets, not components. Follow each wire from one part to the next: parts in series share "
+              "exactly one net, parts in parallel share both, and every junction or corner-to-corner wire is one "
+              "net. Example: a source V1 whose + end is wired to R1, R1's other end to L1 at a node labelled "
+              "mid, L1's other end to ground, and V1's - end to ground gives V1 [n1, GND], R1 [n1, mid], "
+              "L1 [mid, GND]. Put a written simulation command such as .tran 10m in directive, or leave "
+              "directive empty. If a component, polarity, or junction is ambiguous, return an empty components "
+              "array and explain the issue in notes.")
+    reply = chat(model, SYSTEM, prompt, schema, image=image, tokens=1600)
+    dangling = _dangling_nets(reply.get("components"))
+    if dangling:
+        # A net that touches a single pin cannot be right: have the wiring read again, once.
+        retry = (f"{prompt} A previous reading left the net{'s' if len(dangling) > 1 else ''} "
+                 f"{', '.join(dangling)} connected to only one component pin, which is not a closed circuit. "
+                 "Follow those wires again and use the same net name on every part they reach.")
+        second = chat(model, SYSTEM, retry, schema, image=image, tokens=1600)
+        if second.get("components") and len(_dangling_nets(second.get("components"))) < len(dangling):
+            reply = second
+    source, notes = _text_and_notes(reply)
+    components = reply.get("components")
+    if isinstance(components, list):
+        # The small model sometimes lists the ground symbol or a net label as a part.
+        components = [part for part in components if isinstance(part, dict) and isinstance(part.get("reference"), str)
+                      and re.fullmatch(r"\s*[RCLDVIrcldvi]\d{1,3}\s*", part["reference"])]
+        for part in components:
+            if isinstance(part.get("value"), str) and part["reference"].strip()[0] in "VIvi":
+                part["value"] = re.sub(r"(?<=\d)\s*[VA]$", "", part["value"].strip())  # "5V" -> "5"
+    if not components:
+        return Draft(source, "", notes, ".asc")
+    directive = reply.get("directive") if isinstance(reply.get("directive"), str) else ""
+    try:
+        content = build_asc(components, directive)
+    except ValueError as error:
+        return Draft(source, "", (*notes, str(error)), ".asc")
+    pairs = {frozenset(net.strip().lower() for net in part["nets"]) for part in components}
+    if len(components) > 2 and len(pairs) == 1:
+        notes = (*notes, "Every part was read between the same two nets. Check the wiring against your sketch.")
+    left = _dangling_nets(components)
+    if left:
+        notes = (*notes, f"Net {', '.join(left)} reaches only one part. Check that wire on your sketch.")
+    return Draft(source, content, (*notes, "Netlist read from the sketch:", netlist_text(components, directive).strip(),
+                                   "Check values, polarity, and shared nets before trusting the result."), ".asc")
+
+
 def convert_page(frame, target, language, model, workflow="default", evidence=None):
     if target not in DIRECT_TARGETS and (target != "VS Code" or language not in LANGUAGES):
         raise ValueError("Choose a valid target and language.")
@@ -463,6 +585,9 @@ def convert_page(frame, target, language, model, workflow="default", evidence=No
         if content:
             notes = (*notes, "Open in KiCad, then check values, polarity and shared nets.")
         return Draft(source, content, notes, ".sch")
+
+    if target == "LTspice":
+        return circuit_draft(image, model)
 
     properties = PROPERTIES
     if math or workflow == "idea":

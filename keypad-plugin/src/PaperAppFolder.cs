@@ -47,9 +47,9 @@ public abstract class PaperAppFolder : PluginDynamicFolder
             ButtonActionNamesChanged();
             return;
         }
-        if (Menus[menu].Any(button => button[0] == "camera"))
+        foreach (var button in Menus[menu])
         {
-            CommandImageChanged($"{menu}/camera");
+            CommandImageChanged($"{menu}/{button[0]}");
         }
     }
 
@@ -74,7 +74,7 @@ public abstract class PaperAppFolder : PluginDynamicFolder
         string[]? button = parts.Length == 2 && Menus.TryGetValue(parts[0], out var buttons)
             ? buttons.FirstOrDefault(item => item[0] == parts[1])
             : null;
-        return PaperIcons.Read(PaperIcons.ForButton(button), imageSize);
+        return PaperIcons.ForKey(parts[0], button, imageSize);
     }
 
     public override void RunCommand(string parameter)
@@ -124,12 +124,11 @@ public abstract class PaperAppFolder : PluginDynamicFolder
         return JsonSerializer.Deserialize<Dictionary<string, string[][]>>(stream)!;
     }
 
-    internal static string IconForSlot(string? menu, int slot)
-    {
-        return Menus.TryGetValue(menu ?? "home", out var buttons) && slot < buttons.Length
-            ? PaperIcons.ForButton(buttons[slot])
-            : "blank";
-    }
+    internal static string? HomeRoute(int slot) =>
+        Menus.TryGetValue("home", out var apps) && slot < apps.Length ? apps[slot][0] : null;
+
+    internal static string[]? ButtonForSlot(string? menu, int slot) =>
+        Menus.TryGetValue(menu ?? "home", out var buttons) && slot < buttons.Length ? buttons[slot] : null;
 }
 
 public sealed class VsCodePaperFolder : PaperAppFolder
@@ -157,7 +156,17 @@ public sealed class KiCadPaperFolder : PaperAppFolder
     public KiCadPaperFolder() : base("kicad", "KiCad") { }
 }
 
+public sealed class LtSpicePaperFolder : PaperAppFolder
+{
+    public LtSpicePaperFolder() : base("ltspice", "LTspice") { }
+}
+
 public sealed class GitPaperFolder : PaperAppFolder
 {
     public GitPaperFolder() : base("git", "Git") { }
+}
+
+public sealed class PlanPaperFolder : PaperAppFolder
+{
+    public PlanPaperFolder() : base("plan", "Plan") { }
 }
