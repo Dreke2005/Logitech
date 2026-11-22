@@ -1,17 +1,16 @@
-import cv2
+"""Compatibility entry point for the RGB-only preview."""
 
-cap = cv2.VideoCapture(1, cv2.CAP_DSHOW)
+import sys
 
-while True:
-    ret, frame = cap.read()
-    if not ret:
-        print("Failed to grab frame")
-        break
+from rgb_preview import main
 
-    cv2.imshow("Camera 1", frame)
 
-    if cv2.waitKey(1) == 27:  # ESC
-        break
-
-cap.release()
-cv2.destroyAllWindows()
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print("Stopped.")
+        sys.exit(130)
+    except Exception as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(1)

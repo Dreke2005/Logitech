@@ -19,6 +19,9 @@ import numpy as np
 
 CALIBRATION_WINDOW = "Gaze calibration"
 
+
+def _capture(device, backend, width, height, output, stop, model_path=None, mirror=False,
+             eye_model_path=None, exposure_lock=None):
 # This restored entrypoint lives beside the keyboard detector, while its
 # hand/gaze implementation modules remain in the copied Logitech-Keypad folder.
 _COPIED_PROJECT_DIR = Path(__file__).resolve().parent / "Logitech-Keypad"
@@ -49,6 +52,21 @@ def _capture(device, backend, width, height, output, stop, model_path=None, mirr
                 width=width, height=height, fourcc="MJPG", fps=30,
             )
             resources.callback(cap.release)
+            exposure = None
+            if exposure_lock is not None:
+                # Paper mode: keep the paper bright but not clipped, and steady while a recording runs.
+                from paper_exposure import PaperExposure, PaperFocus
+
+                exposure = PaperExposure(cap)
+                resources.callback(exposure.release)
+                focus = PaperFocus(cap)  # The autofocus hunts between hand and paper; lock it on the paper.
+                resources.callback(focus.release)
+            # Stop when the program that started this worker is gone, even if it was killed: a
+            # worker left behind keeps the camera, and the next program then gets black frames.
+            import multiprocessing
+
+            parent = multiprocessing.parent_process()
+            while not stop.is_set() and (parent is None or parent.is_alive()):
             while not stop.is_set():
                 ok, frame = cap.read()
                 if not ok or frame is None:
@@ -56,6 +74,9 @@ def _capture(device, backend, width, height, output, stop, model_path=None, mirr
                     continue
                 if mirror:
                     frame = cv2.flip(frame, 1)
+                if exposure is not None:
+                    exposure.update(frame, locked=exposure_lock.is_set())
+                    focus.update(frame, locked=exposure_lock.is_set())
                 hand_sample = hands.process(frame) if hands is not None else None
                 eye_sample = eyes.process(frame) if eyes is not None else None
                 try:
@@ -67,6 +88,13 @@ def _capture(device, backend, width, height, output, stop, model_path=None, mirr
             output.put(("error", str(exc)), timeout=0.2)
         except queue.Full:
             pass
+    finally:
+        # Do not wait for a frame nobody will read: without this the worker hangs at exit when
+        # its parent is gone, and keeps the process (and on some drivers the camera) alive.
+        output.cancel_join_thread()
+
+
+def _desktop_banner(frame, status, gesture_status, navigation_status=None):
 
 
 def _desktop_banner(frame, status, gesture_status, navigation_status=None,
@@ -77,6 +105,7 @@ def _desktop_banner(frame, status, gesture_status, navigation_status=None,
         lines.append(gesture_status)
     if navigation_status:
         lines.append(navigation_status)
+    lines.append("Ctrl+Alt+F8   Pause / resume")
     lines.append("Hand control active | Ctrl+Alt+F8 pauses/resumes")
     if eye_debug:
         lines.append(eye_debug)
@@ -245,6 +274,7 @@ def main():
 
     model_path = None
     eye_model_path = None
+    if eye_control:
     if eye_control or args.wink_clicks:
         from eye_pointer import ensure_eye_model
 
@@ -280,6 +310,9 @@ def main():
                                                args.height, output, stop, model_path, args.mirror,
                                                eye_model_path), daemon=True)
     keyboard = None
+    desktop = gestures = gaze = None
+    desktop_enabled = shortcut_held = False
+    status = "Paused. Press Ctrl+Alt+F8 to enable desktop control."
     desktop = gestures = gaze = hand_pointer = wink_clicker = None
     desktop_enabled = True
     shortcut_held = False
@@ -429,6 +462,13 @@ def main():
                         if gaze is not None:
                             status = gaze.update(eye_sample)
                         if gestures is not None and (gaze is None or not gaze.calibrating):
+                            hand_status = gestures.update(tracking)
+                            navigation_status = desktop.navigation_feedback()
+                            if gaze is None:
+                                status = hand_status
+                            else:
+                                gesture_status = hand_status
+                    frame = _desktop_banner(frame, status, gesture_status, navigation_status)
                             gesture_tracking = tracking
                             if args.right_hand_only and tracking is not None:
                                 gesture_tracking = dict(tracking)

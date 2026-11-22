@@ -1,0 +1,14 @@
+type: plugin4
+name: PaperDesk
+displayName: LogiInsight Paper
+description: Capture and route handwriting drafts using dynamic keypad actions.
+version: 1.0
+author: LogiInsight prototype
+copyright: Copyright 2026 LogiInsight prototype contributors
+pluginFileName: PaperDeskPlugin.dll
+pluginFolderWin: bin
+supportedDevices:
+  - LoupedeckExtendedFamily
+minimumLoupedeckVersion: 6.4
+license: MIT
+licenseUrl: https://opensource.org/licenses/MIT

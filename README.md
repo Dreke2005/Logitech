@@ -1,214 +1,202 @@
-# Logitech camera and hand-control project
+# LogiInsight RGB preview
 
-These instructions are for Windows PowerShell. Run commands from this folder:
-`C:\Users\victo\Documents\projet\Logitech`.
+## RGB preview with a tap keyboard (Command Prompt)
 
-## Setup
+From `C:\Users\andre\git\Logitech`:
 
-Install the main project dependencies and the separate hand-control environment:
-
-```powershell
+```cmd
 uv sync
-uv sync --project .\Logitech-Keypad
+uv run rgb_preview.py
 ```
 
-The dual-camera launcher uses the nested environment for camera 0 hand
-controls and the main environment for camera 1 typing or paper reading.
+The preview automatically selects `LVNext Camera` and runs MediaPipe Hand
+Landmarker on the PC. Up to two hands are drawn with 21 landmarks each and five
+named fingertips; the index fingertip is highlighted in yellow. Show your hands
+in the camera's view. Press **q**, **Escape**, or close the window to stop.
+`uv run test_cam2.py` opens the same preview. No SSH credentials are needed.
 
-List the available RGB cameras if you need to check their indices:
+Keep both hands visible, bring your thumbs close together, and relax your
+fingers as if you were about to type. You can choose where to hold your hands
+and rotate them within the image. Hold still for about two-thirds of a second.
+The keyboard uses the midpoint between your thumbs as its reference, follows
+the angle of your hands, and fits the AZERTY home row to your resting fingers.
+Space is centered at the thumb midpoint. The layout stays fixed through small
+hand shifts and thumb movements. To dismiss it, keep both thumbs visible and
+move them clearly apart for about 0.4 seconds. Bring them together again to
+build a new layout. Press **R** in the preview to reset it immediately.
 
-```powershell
-uv run .\rgb_preview.py --list
+Move a fingertip over a key, dip it down toward the desk, then lift it while
+keeping the palm steady. A completed tap enters one key in the text area below
+the video. Thumbs can tap Space. Brief tracking gaps pause input and cancel
+unfinished taps. Return your hands to the same area to resume on the existing
+layout. Use `--no-keyboard` for the fingertip overlay.
+
+The preview uses Logitech's `camera_utils.open_camera()` to open the RGB stream,
+then reads frames with OpenCV. MediaPipe extracts hand landmarks on the PC. The
+Logitech SFTP JSON provides face results, so this interaction uses the RGB path
+and requires no camera network credentials. Tap detection estimates movement
+from a single camera view, using finger flexion and model-estimated depth
+relative to the knuckle. Keep both thumbs and fingertips visible.
+
+On first run, the versioned model downloads from Google's MediaPipe model
+storage into `models/hand_landmarker.task` (about 8 MB, excluded from Git).
+Later runs work offline. Use `--model PATH` for an existing local model.
+MediaPipe's model documentation: https://developers.google.com/edge/mediapipe/solutions/vision/hand_landmarker?tab=Python
+
+```cmd
+uv run rgb_preview.py --list
+uv run rgb_preview.py --mirror
+uv run rgb_preview.py --no-hands
+uv run rgb_preview.py --landmarks-jsonl fingertips.jsonl
 ```
 
-The examples below use camera 0 for the Logitech RGB hand-control camera and
-camera 1 for the keyboard or paper view. Change the indices if your camera list
-shows a different order. Press **Q** or **Esc** to close a camera preview.
+`--mirror` flips the frame before inference so the drawn and exported coordinates
+match the displayed image. The JSONL option records metadata only when requested
+and overwrites the named output file. Each line contains a host monotonic
+`timestamp_ms`, `frame_size`, and `hands`. Each hand has 21 `landmarks` and five
+`fingertips`, including `hands[i]["fingertips"]["index"]["pixel"]` for keyboard
+hit testing. `x` and `y` are normalized image coordinates; `pixel` contains
+`[x, y]` in displayed frame pixels. `z` is estimated relative depth, not desk
+contact. Empty `hands` clears detections; list order is not a stable hand ID.
+Handedness is the model's prediction on the input image and can change with mirroring.
 
-## Run everything together
+Tracking runs inside the isolated capture process so the UI can stop it if a
+camera driver stalls. The root environment uses `opencv-contrib-python`, the
+GUI OpenCV build required by MediaPipe; avoid installing another OpenCV build
+alongside it.
 
-Run the hand mouse controls and wink clicks on camera 0 with physical keyboard
-typing on camera 1:
+Checks:
 
-```powershell
-uv run .\run_dual_camera_controls.py
+```cmd
+uv run python -m unittest discover -s tests -v
+uv run rgb_preview.py --frames 30 --no-display
 ```
 
-The camera 0 controls start active. **Ctrl+Alt+F8** pauses or resumes them.
-**Ctrl+Alt+F9** switches camera 1 between keyboard typing and Paper Workbench
-in the LaTeX/formula menu. The launcher closes the current camera 1 app before
-starting the other.
+## Desktop control with eyes and hands
 
-To start directly in paper/formula mode:
-
-```powershell
-uv run .\run_dual_camera_controls.py --paper
+```cmd
+uv run rgb_preview.py --mode desktop --mirror
 ```
 
-The optional MX Keypad can be enabled for the paper session with:
+Press **Ctrl+Alt+F8** to enable desktop input. With the preview focused, press
+**C** and follow the full-screen dot through 17 positions on your primary
+monitor. Keep your head steady and spend about two seconds looking at each dot.
+Then keep looking at the **center dot** while following four prompts to turn
+your head slightly left and right and tilt it up and down. The last four holds
+teach the pointer how your eye measurements change when you move your head
+but keep looking at the same spot. Allow about 45 seconds for the full pass.
+Use **Esc** to cancel or **C** to restart from the preview. The first run downloads
+Google's Face Landmarker model.
 
-```powershell
-uv run .\run_dual_camera_controls.py --paper --keypad
+Once calibrated, look where you want the pointer to go. Blink one eye
+deliberately and reopen it for a left-click. An ordinary blink with both eyes
+doesn't click. The pointer holds through small fluctuations and responds faster
+to a sustained change in where you look. Head correction works within the range
+covered by the calibration. Press **C** to recalibrate if the camera moves.
+Hand navigation works before and after gaze calibration. It pauses
+while the full-screen targets are showing. To test hands alone, run
+`uv run rgb_preview.py --mode touchpad --mirror`.
+
+Keep the wrist and fingertips of your gesture hand visible. Only one hand
+should make a navigation pose at a time.
+
+| Gesture | Action |
+| --- | --- |
+| Open your hand with your fingers together and move it down, up, or sideways | Scroll in the direction of movement |
+| Tuck middle, ring, and pinky. Spread thumb and index | Zoom in (Ctrl+wheel) |
+| Tuck middle, ring, and pinky. Pinch thumb and index | Zoom out (Ctrl+wheel) |
+| Bring all five fingertips of one hand together in front of the knuckles and hold briefly | Open Chrome's tab search and overview (Ctrl+Shift+A) |
+| Extend index, middle, and ring with pinky folded. Swipe left or right | Previous or next tab in apps that support Ctrl+Tab |
+| Make a fist **or** hold a flat hand with your fingers spread | Stop and reset any gesture |
+
+Each zoom gesture locks to its first direction. Return your thumb and index
+to the starting position and repeat the stroke to keep zooming in that
+direction. Hold either reset pose briefly to finish. You can move your hand
+while holding that pose without sending commands. Bring your fingers back
+together to start scrolling from the new position, or start a fresh pinch.
+Open your hand or make a fist between tab-overview gestures. Lower a finger
+between tab swipes. Keep the browser window focused for tab commands. The
+preview labels each navigation command it sends to Windows. Use **Ctrl+Alt+F8**
+to pause from any app.
+Press **Q** or **Esc** in the preview to close it. The gaze estimate is
+experimental and depends on camera placement, lighting, and eye visibility.
+Use `--mode eye` for gaze alone or `--mode touchpad` for hand navigation with a
+physical mouse. The tracking runs locally on the Logitech RGB stream.
+
+## Live lip reading (experimental)
+
+After completing the [Auto-AVSR model setup](silent_transcription_setup.md),
+start the RGB preview in lip-reading mode.
+
+```cmd
+uv run rgb_preview.py --mode lip
 ```
 
-The hand controls stay on camera 0 while camera 1 runs one of the two other
-workflows. Keyboard typing and live paper reading share camera 1, so they are
-switched between instead of running simultaneously.
+Once the model is ready, focus the preview and press **Space**. With your full
+face visible, silently mouth a short English phrase and press **Space** again.
+The draft appears below the RGB feed. The model runs locally, keeps the last
+phrase in memory during processing, and uses RGB video alone. Each phrase
+submits automatically at 10 seconds. Review the draft before using it.
 
-## Run each feature separately
+The [model setup](silent_transcription_setup.md) also covers transcription of
+existing video files.
 
-### Live virtual keyboard and fingertips
+## Handwriting to LaTeX, code, and KiCad
 
-Show both hands. Hold the thumbs together briefly to place the on-screen
-keyboard; spread the thumbs to dismiss it. Press **R** to reset its layout.
+Run **uv run paper_workbench.py** to capture a page or open a photo. Choose a
+format, check the transcription, and export the editable draft. The MX Keypad
+can select the output and display a second menu for VS Code languages.
+See the [Paper Workbench guide](paper_workbench.md).
+
+## SDK face AI preview
+
+Live OpenCV RGB video with the camera's face boxes and optional 478-point
+landmarks, fetched from `/files/logi_conf/logiwebcam_ai_output.json` over SFTP.
+SFTP runs on a background thread so slow AI reads do not block the video loop.
+The preview hides overlays after two seconds without a new camera timestamp
+and shows waiting, inactive, or stale status in the window.
+
+## Run on Windows (PowerShell)
+
+From this repository:
 
 ```powershell
-uv run .\rgb_preview.py --mode keyboard --device 0 --mirror
+py -3 -m venv logiinsight_api/.venv
+& ./logiinsight_api/.venv/Scripts/python.exe -m pip install opencv-python numpy paramiko
+
+$env:LOGIWEBCAM_USER = Read-Host 'User name from kit card'
+$env:LOGIWEBCAM_PASSWORD = Read-Host 'Password from kit card' -MaskInput
+
+& ./logiinsight_api/.venv/Scripts/python.exe ./logiinsight_api/check_connection.py
+& ./logiinsight_api/.venv/Scripts/python.exe ./logiinsight_api/rgb_ai_live.py --face-mesh
 ```
 
-For fingertip tracking without the virtual keyboard:
+`-MaskInput` requires PowerShell 7.1+. Keep credentials in environment variables;
+do not save them in source files. The connection checker may report missing AI
+data until the RGB stream is open.
+
+The camera's USB network adapter needs the PC address `192.168.1.20`, subnet mask
+`255.255.255.0`, and empty gateway/DNS. The camera is at `192.168.1.10:22`.
+See the [SDK setup guide](logiinsight_api/README.md) for adapter setup.
+
+Choose the landscape RGB camera when prompted. Use `--device 1` (or its actual
+index) to skip selection. Press **q**, **Escape**, or **Ctrl+C** to quit.
+Omit `--face-mesh` for face boxes only; `--no-overlay` shows video with AI status.
+
+Video and JSON are independent: overlays may lag a moving face. Coordinates
+are absolute RGB stream pixels, and mesh points are sometimes absent. Camera
+timestamps can wrap or jump; freshness uses host monotonic time and checks
+whether the device timestamp changes. No host/device clock subtraction is used.
+Keep experiments short: the SDK documents possible overheating/freezing after
+about ten minutes of continuous AI. After unplugging, restart the preview.
+
+For exact image/result pairs, the SDK also supports `--device-snapshot` (much
+slower, about two seconds per 1080p snapshot).
+
+Reference: [Logitech API documentation](https://raw.githubusercontent.com/Logitech/hackathons/master/docs/logiinsight/API.md).
+
+## Verify without hardware
 
 ```powershell
-uv run .\rgb_preview.py --mode keyboard --device 0 --mirror --no-keyboard
-```
-
-### Hand-only or upper-body pose capture
-
-Hand-only capture tracks the two hands and their finger landmarks:
-
-```powershell
-uv run .\hand_only_capture.py --camera 0
-```
-
-This separate view includes arm/body pose landmarks:
-
-```powershell
-uv run .\hand_pose_capture.py --camera 0
-```
-
-### Hand mouse, gestures, and wink clicks
-
-The standalone hand-control view starts active. Point the left index left to
-catch/drag the pointer; use the right hand for navigation gestures. A left-eye
-wink holds the left button until the eye opens; a right-eye wink clicks the
-right button. Both eyes closed are ignored.
-
-```powershell
-uv run .\rgb_preview.py --mode touchpad --device 0 --mirror `
-  --right-hand-only --hand-pointer --wink-clicks
-```
-
-### Physical keyboard mapping and typing
-
-Check or calibrate the keyboard mapping with the live preview:
-
-```powershell
-uv run .\test_key_mapping.py --camera 1
-```
-
-It searches for the keyboard automatically. Press **Enter** to confirm a
-candidate, **A** to rescan, or **C** to click the four corners in order:
-top-left, top-right, bottom-right, bottom-left. Press **S** to save a snapshot.
-
-Run the typing detector:
-
-```powershell
-uv run .\keyboard_typing_detector.py --camera 1 --finger indexes-only
-```
-
-Press **C** and click the four keyboard corners if automatic mapping is not
-right; drag numbered corners to adjust them. Click a text field before typing.
-To keep output to text keys, add `--text-only`. To preview without sending
-keystrokes to other apps, add `--no-system-output`.
-
-### Paper reading and formulas
-
-Run Paper Workbench with a live camera:
-
-```powershell
-uv run .\paper_workbench.py --camera 1
-```
-
-Or open an existing image:
-
-```powershell
-uv run .\paper_workbench.py --image .\page.jpg
-```
-
-Use the on-screen buttons to choose an app and action, then review the reading
-and generated draft. The app needs its local Ollama vision model; setup and
-writing guidance are in [Logitech-Keypad/paper_workbench.md](Logitech-Keypad/paper_workbench.md).
-The physical keypad is optional; the on-screen controls work without it.
-
-To install the MX Keypad integration, install Logi Options+ and its plugin
-service, then run the setup script from the project folder:
-
-```powershell
-.\Logitech-Keypad\keypad-plugin\setup.ps1
-```
-
-Then launch Paper Workbench with `--keypad`, or run the combined launcher with
-`--paper --keypad`. The keypad plugin and the app communicate locally.
-
-### Raw camera diagnostics
-
-List DirectShow devices with `rgb_preview.py --list`. The following scripts
-perform basic camera probes:
-
-```powershell
-uv run .\test_cam.py
-uv run .\test_cam2.py
-uv run .\test_cam3.py
-```
-
-### LogiInsight AI over the camera network
-
-The SDK's AI data and capture examples use SSH/SFTP credentials from the card
-in the kit. Set them in the current PowerShell session, then check the link:
-
-```powershell
-$env:LOGIWEBCAM_USER = Read-Host 'Device user name'
-$env:LOGIWEBCAM_PASSWORD = Read-Host 'Device password' -MaskInput
-uv run .\check_connection.py
-```
-
-Live RGB with AI overlays:
-
-```powershell
-uv run .\rgb_ai_live.py
-```
-
-Capture RGB frames and AI results:
-
-```powershell
-uv run .\rgb_ai_capture.py --frames 10 --output .\captures
-```
-
-These network/AI examples are separate from local RGB hand tracking. For
-network troubleshooting, see [docs/API.md](docs/API.md) and run
-`uv run .\check_connection.py`.
-
-### Near-infrared camera and microphone
-
-```powershell
-uv run .\example_IR.py
-uv run .\example_audio.py --list
-uv run .\example_audio.py --duration 10
-```
-
-The IR preview can save a snapshot with **S**. The audio example saves a WAV
-and spectrum plot under `audio_captures`.
-
-## Excluded experimental features
-
-Eye-gaze pointer control and live lip reading are experimental and are not part
-of the recommended launch commands. Wink clicks remain available through the
-camera 0 hand-control workflow.
-
-## Tests
-
-Run the project tests with:
-
-```powershell
-uv run python -m unittest discover -s Logitech-Keypad\tests -v
+uv run --locked python -m unittest discover -s tests
 ```

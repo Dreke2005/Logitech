@@ -3,7 +3,9 @@
 paramiko>=3.0
 numpy>=1.24
 # GUI build is required (cv2.imshow). Do not install opencv-python-headless.
-opencv-python>=4.8
+opencv-contrib-python>=4.8
+mediapipe>=0.10.21,<0.11
+pygrabber>=0.2
 # Microphone (example_audio.py). On Linux PortAudio is a
 # system package: sudo apt install libportaudio2
 sounddevice>=0.4.6
