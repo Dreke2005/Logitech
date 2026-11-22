@@ -1,12 +1,12 @@
 """Live keyboard calibration and fingertip-to-key mapping test.
 
 Run ``uv run python test_key_mapping.py``. The default camera is camera 1.
-Press C, then click the real keyboard corners in this order: top-left,
- top-right, bottom-right, bottom-left. Keep the entire keyboard visible.
-The app then shows the key under each detected index fingertip.
+Automatic detection starts immediately. Press Enter to confirm the outlined
+keyboard, or C to set the four corners manually in this order: top-left,
+top-right, bottom-right, bottom-left. The app then maps index fingertips.
 
-Controls: C calibrate, R reset, A toggle automatic detection, S save snapshot,
-Q or ESC quit.
+Controls: Enter confirm, A rescan, C manual corner selection, R reset,
+S save snapshot, Q or ESC quit.
 """
 
 import argparse
@@ -62,8 +62,8 @@ def run(camera_index: int = 1, confidence: float = 0.55) -> None:
     try:
         capture, info = open_camera(camera_index, fourcc=None)
         print(f"Camera {camera_index}: {info['width']}x{info['height']} [{info['backend']}]")
-        print("Press C, then click keyboard corners: top-left, top-right, bottom-right, bottom-left.")
-        print("Keep the complete physical keyboard in view. S saves a snapshot; Q quits.")
+        print("Automatic search is active. Enter confirms the outlined keyboard; C starts manual corner selection.")
+        print("Keep the complete keyboard in view. A rescans; S saves a snapshot; Q quits.")
         camera_window = "Key mapping - camera view"
         keyboard_window = "Key mapping - rectified keyboard"
         cv2.namedWindow(camera_window, cv2.WINDOW_NORMAL)
@@ -74,7 +74,8 @@ def run(camera_index: int = 1, confidence: float = 0.55) -> None:
             "points": [],
             "calibration": None,
             "selecting": False,
-            "automatic": False,
+            "automatic": True,
+            "auto_detection": None,
         }
 
         def on_mouse(event, x, y, _flags, _userdata):
@@ -96,6 +97,9 @@ def run(camera_index: int = 1, confidence: float = 0.55) -> None:
             if not ok or frame is None:
                 print("Camera stopped returning frames.")
                 break
+            # Mirror at the input boundary so detection, manual corner clicks,
+            # hand landmarks, fingertip mapping, and previews share coordinates.
+            frame = cv2.flip(frame, 1)
             state["frame"] = frame.copy()
             frame_number += 1
 
@@ -103,15 +107,16 @@ def run(camera_index: int = 1, confidence: float = 0.55) -> None:
             image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
             result = landmarker.detect_for_video(image, time.monotonic_ns() // 1_000_000)
 
+            if state["automatic"] and (frame_number % 5 == 1):
+                state["auto_detection"] = detect_keyboard(frame)
             if state["calibration"] is not None:
                 detection = _make_detection(frame, state["calibration"])
-            elif state["automatic"] and (frame_number % 5 == 1):
-                detection = detect_keyboard(frame)
-                state["auto_detection"] = detection
-            elif state["automatic"]:
-                detection = state.get("auto_detection")
             else:
                 detection = None
+            candidate = state.get("auto_detection") if state["automatic"] else None
+            preview_detection = detection
+            if preview_detection is None and candidate is not None:
+                preview_detection = _make_detection(frame, candidate.corners)
 
             view = frame.copy()
             if result.pose_landmarks:
@@ -129,9 +134,15 @@ def run(camera_index: int = 1, confidence: float = 0.55) -> None:
                 mapped.append((side, (x, y), label))
 
             status = ""
+            if preview_detection is not None:
+                outline_color = (40, 220, 40) if detection is not None else (0, 190, 255)
+                cv2.polylines(view, [preview_detection.corners.astype(np.int32).reshape(-1, 1, 2)],
+                              True, outline_color, 2)
+                for i, (x, y) in enumerate(preview_detection.corners.astype(int)):
+                    cv2.circle(view, (x, y), 5, outline_color, -1)
+                    cv2.putText(view, str(i + 1), (x + 6, y - 6),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.55, outline_color, 2)
             if detection is not None:
-                cv2.polylines(view, [detection.corners.astype(np.int32).reshape(-1, 1, 2)],
-                              True, (40, 220, 40), 2)
                 for side, (x, y), label in mapped:
                     point = (round(x), round(y))
                     cv2.circle(view, point, 8, (0, 80, 255), -1)
@@ -142,8 +153,12 @@ def run(camera_index: int = 1, confidence: float = 0.55) -> None:
                 cv2.imshow(keyboard_window, draw_keyboard_view(detection, selected))
                 status = " | ".join(f"{side} index -> {label or 'no key'}"
                                     for side, _xy, label in mapped) or "No hand detected"
+            elif candidate is not None:
+                cv2.imshow(keyboard_window, preview_detection.warped)
+                status = "Keyboard candidate: press Enter to confirm, C to adjust corners, A to rescan"
             else:
-                status = "Click C, then select the four corners of the real keyboard"
+                status = ("Searching for keyboard... keep all four corners visible; "
+                          "press C for manual corner selection")
 
             for i, (x, y) in enumerate(state["points"]):
                 cv2.circle(view, (x, y), 7, (255, 0, 255), -1)
@@ -163,18 +178,24 @@ def run(camera_index: int = 1, confidence: float = 0.55) -> None:
                 state["selecting"] = True
                 state["automatic"] = False
                 print("Click the keyboard corners in order: TL, TR, BR, BL.")
+            elif pressed in (13, 10, ord(" ")) and candidate is not None:
+                state["calibration"] = candidate.corners.copy()
+                state["automatic"] = False
+                state["selecting"] = False
+                print("Keyboard candidate confirmed; key mapping is active.")
             elif pressed == ord("r"):
                 state["points"] = []
                 state["calibration"] = None
                 state["selecting"] = False
                 state["auto_detection"] = None
-                print("Calibration reset.")
+                state["automatic"] = True
+                print("Calibration reset; automatic keyboard search restarted.")
             elif pressed == ord("a"):
-                state["automatic"] = not state["automatic"]
+                state["automatic"] = True
                 state["calibration"] = None
                 state["selecting"] = False
                 state["auto_detection"] = None
-                print(f"Automatic keyboard detection: {state['automatic']}")
+                print("Rescanning for a keyboard candidate.")
             elif pressed == ord("s") and detection is not None:
                 snapshot_dir = Path(__file__).with_name("captures")
                 snapshot_dir.mkdir(exist_ok=True)
