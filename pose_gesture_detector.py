@@ -8,6 +8,10 @@ hands leave the frame. A right/left wink clicks at the cursor; both eyes closed
 does nothing. Press Q or ESC to quit.
 """
 
+# Author: Victor Lancieux
+# Date: Original date unknown; metadata recorded 2026-11-22.
+# Purpose: Control zoom, scrolling, rotation, and wink clicks with camera 0 gestures.
+
 import argparse
 import time
 from typing import Any, Dict, Optional

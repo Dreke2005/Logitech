@@ -5,6 +5,10 @@ tries to detect the keyboard automatically. Press C to select its corners
 manually (TL, TR, BR, BL). Press Q or ESC to quit.
 """
 
+# Author: Victor Lancieux
+# Date: 2026-11-22 (hand-only tracking and automatic keyboard detection integrated)
+# Purpose: Map finger taps to keyboard keys and optionally send key output.
+
 import argparse
 import ctypes
 import os
@@ -681,6 +685,11 @@ def run(camera_index: int = 1, confidence: float = 0.55,
             cv2.imshow(camera_window, view)
 
             pressed = cv2.waitKey(1) & 0xFF
+            try:
+                if cv2.getWindowProperty(camera_window, cv2.WND_PROP_VISIBLE) < 1:
+                    break
+            except cv2.error:
+                break
             if pressed == ord("c"):
                 state["points"] = []
                 state["calibration"] = None

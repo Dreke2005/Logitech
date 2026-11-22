@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.venv/
+captures/
+ir_captures/
+*.csv
+*:Zone.Identifier
+audio_captures/
+*.wav
+models/*.task
+models/*.download
+keypad-plugin/bin/
+keypad-plugin/src/obj/
+mouthed-*.mp4

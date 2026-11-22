@@ -1,8 +1,12 @@
 """Track and display hands and finger landmarks only (no face or arms).
 
 Run with ``uv run python hand_only_capture.py``. Press Q or ESC to quit.
-The first run downloads MediaPipe's Hand Landmarker model beside this file.
+The first run downloads MediaPipe's Hand Landmarker model into models/.
 """
+
+# Author: Victor Lancieux
+# Date: 2026-11-22 (hand-only capture file created)
+# Purpose: Capture and visualize two hands and their 21 landmarks.
 
 import argparse
 from pathlib import Path
@@ -25,7 +29,8 @@ FINGER_TIPS = {"thumb": 4, "index": 8, "middle": 12, "ring": 16, "pinky": 20}
 
 
 def ensure_hand_model() -> Path:
-    model_path = Path(__file__).with_name("hand_landmarker.task")
+    model_path = Path(__file__).resolve().parent / "models" / "hand_landmarker.task"
+    model_path.parent.mkdir(parents=True, exist_ok=True)
     if not model_path.exists():
         url = (
             "https://storage.googleapis.com/mediapipe-models/hand_landmarker/"
@@ -38,7 +43,7 @@ def ensure_hand_model() -> Path:
             model_path.unlink(missing_ok=True)
             raise RuntimeError(
                 "Could not download hand_landmarker.task. Download it from "
-                f"{url} and place it beside hand_only_capture.py."
+                f"{url} and place it at models/hand_landmarker.task."
             ) from exc
     return model_path
 
