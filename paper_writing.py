@@ -54,6 +54,7 @@ class TipSample:
     # point was seen, or hidden by the fingers and put where the hand ends on the pen's line.
     pen: bool = False
     over: bool = False  # Taken where ink already lay: the pen passed over writing, it did not write it.
+    late: bool = False  # Taken where a mark had appeared before the pen came there: the pen did not make it.
 
 
 @dataclass(frozen=True)
@@ -325,10 +326,21 @@ class WritingSession:
         if self.reference is not None and self._contains(sample):
             # The back of the barrel stands in for the wrist: back-to-nib points away from the writer.
             shown, x, y = getattr(self, "_shown", None), int(sample[0]), int(sample[1])
-            over = bool(pen.tapered and shown is not None and 0 <= y < shown.shape[0] and 0 <= x < shown.shape[1]
+            inside = 0 <= y < frame.shape[0] and 0 <= x < frame.shape[1]
+            over = bool(pen.tapered and inside and shown is not None and shown.shape == frame.shape[:2]
                         and shown[max(0, y - 3):y + 4, max(0, x - 3):x + 4].any())
-            self.tips.setdefault(side, deque(maxlen=3000)).append(
-                TipSample(now, sample, pen.tapered, False if over else None, wrist=pen.back, pen=True, over=over))
+            # A mark registered before the nib ever came near was not written by it (old writing that a
+            # hand covered at the key press, a shadow, a sheet that crept): the pen only passes over it.
+            late = False
+            if pen.tapered and inside and not over and self.ink_count is not None \
+                    and self.ink_count.shape == frame.shape[:2]:
+                reach = max(3, round(0.5 * self.ink_radius))
+                window = slice(max(0, y - reach), y + reach + 1), slice(max(0, x - reach), x + reach + 1)
+                late = bool((self.ink_count[window] != 0).any()) and not (
+                    shown is not None and shown.shape == frame.shape[:2] and shown[window].any())
+            self.tips.setdefault(side, deque(maxlen=3000)).append(TipSample(
+                now, sample, pen.tapered, False if over or late else None, wrist=pen.back, pen=True, over=over,
+                late=late))
 
     def _nib(self, tip):
         """Where the nib is for a tracked tip: the point itself when it was seen on the pen, else the
@@ -456,15 +468,31 @@ class WritingSession:
         with them: the last letters are often written while the point is hidden by the fingers. (Where
         the fingers hide the point its place is only known roughly, so twice the distance is allowed.)"""
         result = np.zeros(ink.shape, np.uint8)
-        count, labels, stats, _ = cv2.connectedComponentsWithStats(ink, connectivity=8)
-        seen = [sample for sample in samples if sample.pen]
-        if count <= 1 or not seen:
+        seen = [sample for sample in samples if sample.pen and not sample.late]
+        if not seen:
             return result
         reach = max(4, round(0.75 * self.ink_radius))
+        # Only around the pen's path: writing continues a line by a few letters at most beyond it.
+        spots = np.asarray([sample.point for sample in seen], int)
+        pad = 2 * reach + 14 * self.ink_radius
+        height, width = ink.shape
+        left, top = max(0, int(spots[:, 0].min()) - pad), max(0, int(spots[:, 1].min()) - pad)
+        right, bottom = min(width, int(spots[:, 0].max()) + pad), min(height, int(spots[:, 1].max()) + pad)
+        if right - left < 2 or bottom - top < 2:
+            return result
+        result[top:bottom, left:right] = self._written_in(
+            np.ascontiguousarray(ink[top:bottom, left:right]), seen, (left, top), reach)
+        return result
+
+    def _written_in(self, ink, seen, origin, reach):
+        result = np.zeros(ink.shape, np.uint8)
+        count, labels, stats, _ = cv2.connectedComponentsWithStats(ink, connectivity=8)
+        if count <= 1:
+            return result
         trail = np.zeros(ink.shape, np.uint8)
         previous = None
         for sample in seen:
-            point = int(sample.point[0]), int(sample.point[1])
+            point = int(sample.point[0]) - origin[0], int(sample.point[1]) - origin[1]
             if not sample.visual:
                 cv2.circle(trail, point, 2 * reach, 1, -1)
                 previous = None
@@ -477,7 +505,7 @@ class WritingSession:
             previous = sample.time, point
         area = stats[:, cv2.CC_STAT_AREA]
         covered = np.bincount(labels[trail != 0], minlength=count)
-        points = np.asarray([sample.point for sample in seen], float)
+        points = np.asarray([sample.point for sample in seen], float) - origin
         accepted = np.zeros(count, bool)
         for label in np.flatnonzero(covered >= 0.5 * area):
             if label == 0:
@@ -485,8 +513,9 @@ class WritingSession:
             x, y, w, h = stats[label, :4]
             near = ((points[:, 0] >= x - reach) & (points[:, 0] < x + w + reach)
                     & (points[:, 1] >= y - reach) & (points[:, 1] < y + h + reach))
-            # A resting nib writes nothing: the point moved, and about as far as the mark is long.
-            if near.any() and max(np.ptp(points[near, 0]), np.ptp(points[near, 1])) >= max(3.0, 0.4 * max(w, h) - 3):
+            # A resting nib writes nothing (a hand at rest still trembles by a few pixels): the point moved,
+            # and about as far as the mark is long.
+            if near.any() and max(np.ptp(points[near, 0]), np.ptp(points[near, 1])) >= max(6.0, 0.5 * max(w, h) - 2):
                 accepted[label] = True
         longest = np.maximum(stats[:, cv2.CC_STAT_WIDTH], stats[:, cv2.CC_STAT_HEIGHT])
         if not accepted.any() or longest[accepted].max() < self.ink_radius:
@@ -520,7 +549,7 @@ class WritingSession:
         # Where ink cannot be registered yet (under the pen and the hand, as _new_ink masks them).
         hidden = self._occlusion_mask(written.shape, (0, 0), grow=1.8) if now is not None else None
         for sample in samples:
-            if not sample.pen or sample.over or (sample.down is False):
+            if not sample.pen or sample.over or sample.late or (sample.down is False):
                 continue
             x, y = int(sample.point[0]), int(sample.point[1])
             if not (0 <= x < width and 0 <= y < height):
@@ -548,6 +577,9 @@ class WritingSession:
         def pen_down(side):
             return sum(1 for sample in self.tips.get(side, ()) if sample.down)
 
+        pen = paths.get("Pen", ())
+        if len(pen) >= max(5, 0.3 * len(self.path)):
+            return pen  # The pen itself was followed: a tip guessed from a hand before it was found is not it.
         return max(paths.values(), key=lambda path: (pen_down(path[0][1]), motion(path)), default=[])
 
     def _stroke_samples(self, side, gray=None, pending=False):
@@ -910,7 +942,9 @@ class WritingSession:
                     added = True
             if not added:
                 break
-        return np.isin(labels, list(chosen)).astype(np.uint8) | accepted
+        kept = np.zeros(count, np.uint8)
+        kept[list(chosen)] = 1
+        return kept[labels] | accepted
 
     def _follow_sheet(self, frame):
         """Have the reference where the sheet is in the frame the selection is made from.
@@ -1123,7 +1157,8 @@ class WritingSession:
         """
         samples = [sample for sample in self.tips.get(side, ()) if sample.wrist is not None]
         if len(samples) < 3:
-            return 0
+            # Too few samples on the sheet: the pen as last seen still points away from the writer.
+            return upright_turn(*np.subtract(self.pen.point, self.pen.back)) if self.pen is not None else 0
         down = [sample for sample in samples if sample.down]
         vectors = np.asarray([np.subtract(sample.point, sample.wrist) for sample in (down or samples)], float)
         return upright_turn(*np.median(vectors, axis=0))

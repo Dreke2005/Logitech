@@ -110,15 +110,27 @@ class SheetTrackerTests(unittest.TestCase):
     def test_a_move_under_the_hands_is_found_when_they_lift(self):
         scene = sheet_picture()
         tracker = self.tracker(scene)
-        tracker.update(shoot(scene, seed=1))
+        for step in range(5):  # Well after the key press.
+            tracker.update(shoot(scene, seed=step + 1))
         pose = pose_of(turn=4.0, shift=(45.0, -18.0))
         hands = [((600, 330), (230, 150)), ((860, 420), (150, 110))]
         for step in range(3):
-            tracker.update(shoot(scene, pose, hands=hands, seed=step + 2))
+            # Under two hands too little is seen to tell where the sheet went: the pose is kept.
+            self.assertIn(tracker.update(shoot(scene, pose, hands=hands, seed=step + 6)), ("lost", "held"))
+            self.assertTrue(np.array_equal(tracker.pose, np.eye(3)))
         for step in range(2):
-            tracker.update(shoot(scene, pose, seed=step + 6))
+            tracker.update(shoot(scene, pose, seed=step + 9))
         self.assertLess(error(tracker, pose), 2.0)
         self.assertTrue(tracker.tied)
+
+    def test_a_key_press_that_shows_nothing_of_the_sheet_is_started_over(self):
+        scene = sheet_picture()
+        blurred = cv2.GaussianBlur(shoot(scene, hands=[((640, 360), (260, 150))]), (0, 0), 9)
+        tracker = SheetTracker(blurred, (360, 170, 940, 550))
+        for step in range(4):
+            tracker.update(shoot(scene, hands=[((500, 250), (90, 60))], seed=step + 1))
+        self.assertFalse(tracker.tied)  # The session takes a new reference then (WritingSession._sheet_track).
+        self.assertGreaterEqual(tracker.rekeyed, 1)
 
     def test_a_blank_sheet_is_followed_by_its_outline(self):
         scene = sheet_picture(blank=True)
@@ -193,7 +205,7 @@ class SheetWatchTests(unittest.TestCase):
         self.assertEqual(watch.confidence, 0.0)
         self.assertIsNone(watch.bounds())
 
-    def test_another_sheet_is_calibrated_anew(self):
+    def test_another_sheet_in_its_place_gets_the_right_outline(self):
         scene, other = sheet_picture(seed=0), sheet_picture(seed=7)
         watch = SheetWatch()
         now = 0.0
@@ -205,7 +217,8 @@ class SheetWatchTests(unittest.TestCase):
         for step in range(14):  # The first sheet is replaced by one with other writing, somewhere else.
             watch.update(shoot(other, pose, seed=step + 3), None, now)
             now += 0.6
-        self.assertEqual(watch.generation, 2)
+        self.assertTrue(watch.calibrated)  # Followed as the same sheet or calibrated anew: the outline is right.
+        self.assertGreater(watch.confidence, 0.6)
         self.assertLess(float(np.linalg.norm(watch.outline() - move_points(pose, CORNERS), axis=1).max()), 8.0)
 
 

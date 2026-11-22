@@ -1892,6 +1892,9 @@ class PaperWorkbench:
         if self.target == "LaTeX" and self.draft is not None and not self.draft.files and text:
             if self.workflow == "equation" and "\\begin{" not in text:
                 return paper_clipboard.render(paper_clipboard.Clip("equation", text, "LaTeX"), "LaTeX").content
+            if "\\begin{document}" in text and "\\end{document}" in text:
+                # A standalone draft: only what is inside the document goes into the user's own document.
+                text = text.split("\\begin{document}", 1)[1].rsplit("\\end{document}", 1)[0].strip()
             return text
         try:
             copied = self.window.clipboard_get().strip()
@@ -1900,6 +1903,8 @@ class PaperWorkbench:
         clip = paper_clipboard.load()
         if clip is not None and clip.matches(copied):
             try:
+                if clip.kind == "plot":  # A figure file cannot be pasted as text; its equation can.
+                    clip = paper_clipboard.Clip("equation", clip.content, clip.source_app)
                 return paper_clipboard.render(clip, "LaTeX", self.language).content
             except (ValueError, SyntaxError):
                 return None

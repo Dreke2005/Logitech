@@ -146,6 +146,7 @@ class SheetTracker:
         self.tied = True  # False once the key picture was started again: the pose no longer goes back to the reference.
         self._picture = self._seen = None
         self._failed = False  # The search for a sheet that jumped found nothing on the scene as it is.
+        self._failed_seen = 0
         self.report = {}
 
     # Pictures --------------------------------------------------------------------------------
@@ -160,7 +161,8 @@ class SheetTracker:
         usable = (hsv[:, :, 1] < 55) & (hsv[:, :, 2] >= 0.6 * self.level)
         # Writing itself is dark or blue, but thin: only what is wider than a stroke is not paper.
         usable = cv2.morphologyEx((~usable).astype(np.uint8), cv2.MORPH_OPEN, np.ones((5, 5), np.uint8)) == 0
-        coloured = (hsv[:, :, 1] >= 55) & (hsv[:, :, 2] >= 60)  # A hand, the pen.
+        # Skin, a red or wooden pen: warm colours. (The laptop is blue and is not a hand.)
+        coloured = ((hsv[:, :, 0] <= 25) | (hsv[:, :, 0] >= 165)) & (hsv[:, :, 1] >= 45) & (hsv[:, :, 2] >= 60)
         if hidden is not None:
             usable &= cv2.resize(hidden, self.small, interpolation=cv2.INTER_NEAREST) == 0
         # Away from the border of what is usable: a hand's outline and its shadow line are not landmarks.
@@ -412,8 +414,9 @@ class SheetTracker:
         asked = self._patch_motion(before, here)
         moved = None if asked is None else self._verify(asked, here, frame_side, far=False)
         departed = gone >= max(4, 0.3 * (found + gone)) or missing >= max(120.0, 0.25 * weight)
-        if not still:
-            self._failed = False
+        shown_now = int(np.count_nonzero(seen))
+        if not still or abs(shown_now - self._failed_seen) > 0.03 * max(self._failed_seen, 1):
+            self._failed = False  # Something moved, or a hand uncovered more of the desk.
         if moved is None and departed and not self._failed:  # Not again on a scene that has not changed.
             # Much of the sheet is not where it was: look for what left among what is new, and of the places
             # it may have gone to, take the one where most patches are found again.
@@ -438,7 +441,7 @@ class SheetTracker:
                     moved = self._verify(candidate, here, frame_side, far=True)
                     if moved is not None:
                         break
-            self._failed = moved is None
+            self._failed, self._failed_seen = moved is None, shown_now
         if moved is None:
             if departed and gone >= max(8, 2 * found):
                 # Most patches are gone: the sheet is elsewhere (on its way, or where it cannot be found).
@@ -457,7 +460,9 @@ class SheetTracker:
                 # Most of the sheet is where it should be. What is missing (a shadow, a sleeve, a hand at the
                 # key press) is forgotten when it stays away while nothing moves.
                 if still:
-                    self._learn(here["view"], here["visible"], visible, explained, decay=departed)
+                    # Forgetting only while the sheet is plainly still there: it may have moved under a hand.
+                    self._learn(here["view"], here["visible"], visible, explained,
+                                decay=departed and found >= max(6, 3 * gone))
                 return self._settle("held")
             self._learn(here["view"], here["visible"], visible, explained, added=True, decay=True)
             return self._settle("steady")
@@ -601,7 +606,7 @@ class SheetWatch:
     def _seen_support(self, tracker, outline):
         edges, judged, _ = self._edges(tracker)
         share, sides, _ = self._support(cv2.dilate(edges, np.ones((7, 7), np.uint8)), judged, outline)
-        return share * min(1.0, sides / 3.0)
+        return share * min(1.0, max(sides, sides + 4, 0) / 3.0) if sides > -4 else 0.0
 
     def update(self, frame, hands=None, now=None):
         """Call for every frame. Cheap: the sheet is looked at every ``interval`` seconds only."""
@@ -681,6 +686,11 @@ class SheetWatch:
                                 or abs((d[0] - c[0]) @ c[2]) < 50 or abs(a[1] @ c[1]) > 0.65):
                             continue
                         corners = np.float32([self._cross(a, c), self._cross(a, d), self._cross(b, d), self._cross(b, c)])
+                        # Each side on the pieces of edge its line was found from, for a third at least
+                        # (a hand may hide the rest): a line that only passes by is not a side.
+                        if min(self._covered(a, corners[0], corners[1]), self._covered(d, corners[1], corners[2]),
+                               self._covered(b, corners[2], corners[3]), self._covered(c, corners[3], corners[0])) < 0.34:
+                            continue
                         if (corners[:, 0].min() < -0.1 * width or corners[:, 0].max() > 1.1 * width
                                 or corners[:, 1].min() < -0.1 * height or corners[:, 1].max() > 1.1 * height):
                             continue
@@ -755,7 +765,8 @@ class SheetWatch:
 
     @staticmethod
     def _lines(edges, least=70.0):
-        """Straight edges as (point, direction, normal, length covered), the longest first, at most ten.
+        """Straight edges as (point, direction, normal, length covered), the longest first, at most fourteen,
+        with the pieces each was found from.
         Pieces of one line on either side of a hand are joined."""
         thin = cv2.ximgproc.thinning(edges * 255) if hasattr(cv2, "ximgproc") else edges * 255
         segments = cv2.HoughLinesP(thin, 1, np.pi / 180, 30, minLineLength=40, maxLineGap=20)
@@ -782,14 +793,28 @@ class SheetWatch:
                 covered += max(0.0, high - max(low, reached))
                 reached = max(reached, high)
             if covered >= least:
-                found.append((line["point"], line["direction"], line["normal"], covered))
-        return sorted(found, key=lambda line: -line[3])[:10]
+                found.append((line["point"], line["direction"], line["normal"], covered, sorted(line["spans"])))
+        return sorted(found, key=lambda line: -line[3])[:14]
+
+    @staticmethod
+    def _covered(line, start, end):
+        """Share of the stretch from ``start`` to ``end`` along a line that its pieces of edge cover."""
+        low, high = sorted(((start - line[0]) @ line[1], (end - line[0]) @ line[1]))
+        if high - low < 1:
+            return 0.0
+        total, reached = 0.0, low
+        for first, last in line[4]:
+            total += max(0.0, min(last, high) - max(first, reached))
+            reached = max(reached, min(last, high))
+        return total / (high - low)
 
     @staticmethod
     def _cross(first, second):
         """Where two lines (point, direction, ...) meet."""
-        solved = np.linalg.solve(np.column_stack([first[1], -second[1]]), second[0] - first[0])
-        return first[0] + solved[0] * first[1]
+        matrix = np.column_stack([first[1], -second[1]])
+        if abs(float(np.linalg.det(matrix))) < 1e-6:
+            return np.float32([1e6, 1e6])  # Parallel: nowhere in the frame.
+        return first[0] + np.linalg.solve(matrix, second[0] - first[0])[0] * first[1]
 
     @staticmethod
     def _ordered(corners):
@@ -803,7 +828,8 @@ class SheetWatch:
     def _support(near, judged, corners, scale=SheetTracker.SCALE):
         """How well an outline is borne out by edges: (share, sides, least). ``share`` is the mean, over
         the sides that can be judged (in the frame, not under a hand), of the part of the side that lies
-        on an edge; ``sides`` how many could be judged; ``least`` the weakest of them."""
+        on an edge; ``sides`` how many could be judged (negative when one is in the frame but under a
+        hand); ``least`` the weakest of them."""
         height, width = near.shape
         corners = np.asarray(corners, np.float32) * scale
         along = np.linspace(0.08, 0.92, 40, dtype=np.float32)[None, :, None]
@@ -818,4 +844,6 @@ class SheetWatch:
         if not sides.any():
             return 0.0, 0, 0.0
         shares = on.sum(axis=1)[sides] / counted[sides]
-        return float(shares.mean()), int(sides.sum()), float(shares.min())
+        # A side in the frame of which too little can be judged lies under a hand: it could be anywhere.
+        covered = int(((inside.sum(axis=1) >= 12) & ~sides).sum())
+        return float(shares.mean()), int(sides.sum()) - 4 * covered, float(shares.min())
