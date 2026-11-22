@@ -1,10 +1,19 @@
-import hermetic  # noqa: F401
 import unittest
 
 import cv2
+import hermetic  # noqa: F401
 import numpy as np
 
-from paper_pen import OneEuro, PenTipTracker, draw_trajectory, estimate_pen_tip, find_closed_loop, locate_pen
+from paper_pen import (
+    OneEuro,
+    PenTip,
+    PenTipTracker,
+    draw_trajectory,
+    estimate_pen_tip,
+    find_closed_loop,
+    find_pen,
+    locate_pen,
+)
 from paper_writing import TipSample, WritingSession, paper_bounds
 
 AXIS = np.array((-0.6, -0.8))  # Pen axis from the hand toward the tip (a right-handed writer).
@@ -230,6 +239,47 @@ class PenTipTests(unittest.TestCase):
         tip = estimate_pen_tip(hand, self.page)
         self.assertTrue(tip.visual)
         self.assertLess(np.linalg.norm(np.subtract(tip.point, nib)), 5)
+
+    @staticmethod
+    def pen_photo():
+        frame = np.full((720, 1280, 3), 245, np.uint8)
+        cv2.ellipse(frame, (425, 413), (32, 25), 0, 0, 360, SKIN, -1)
+        cv2.rectangle(frame, (290, 379), (490, 391), (220, 45, 25), -1)
+        cv2.fillConvexPoly(frame, np.array([(490, 379), (523, 385), (490, 391)], np.int32), (85, 85, 85))
+        return frame
+
+    def test_capture_accepts_an_inside_nib_even_when_the_barrel_extends_outside(self):
+        pen = find_pen(self.pen_photo(), inside=(420, 350, 570, 430))
+        self.assertIsNotNone(pen)
+        self.assertTrue(pen.tapered)
+        self.assertLess(pen.back[0], 420)
+        self.assertLess(np.linalg.norm(np.subtract(pen.point, (523, 385))), 5)
+
+    def test_capture_rejects_an_exterior_or_cut_off_nib(self):
+        frame = self.pen_photo()
+        for boundary in (510, 523):
+            with self.subTest(boundary=boundary):
+                self.assertIsNone(find_pen(frame, inside=(270, 350, boundary, 430)))
+        self.assertIsNone(find_pen(frame[:, :515].copy()))
+
+    def test_sheet_outline_excludes_a_nib_inside_its_bounding_rectangle(self):
+        frame = self.pen_photo()
+        sheet = np.zeros(frame.shape[:2], np.uint8)
+        outline = np.array([(285, 330), (540, 330), (438, 480), (285, 480)], np.int32)
+        cv2.fillConvexPoly(sheet, outline, 1)
+        self.assertIsNone(find_pen(frame, inside=(285, 330, 541, 481), surface=sheet))
+
+    def test_exterior_estimate_is_not_clamped_to_the_capture_edge(self):
+        hand = hand_for_tip((288, 200))
+        self.assertIsNone(estimate_pen_tip(hand, self.page, inside=(300, 160, 400, 300)))
+
+    def test_preview_hides_an_unobserved_tip_and_a_tip_outside_the_capture(self):
+        session = WritingSession(area=(260, 160, 380, 300))
+        session.current_tips["Right"] = 2, PenTip((280, 240), (300, 245), 10, 20, False)
+        session.current_tips["Pen"] = 2, PenTip((250, 240), (300, 245), 10, 20, True)
+        np.testing.assert_array_equal(session.draw(self.page, 2), self.page)
+        session.current_tips["Pen"] = 2, PenTip((300, 240), (310, 245), 10, 20, True)
+        self.assertFalse(np.array_equal(session.draw(self.page, 2), self.page))
 
     def test_tracker_smooths_jitter_and_learns_a_tip_offset(self):
         rng = np.random.default_rng(3)

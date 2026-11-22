@@ -18,23 +18,11 @@ from pathlib import Path
 
 import cv2
 
+from camera_utils import choose_rgb_camera as choose_camera
 from fingertip_tracker import DEFAULT_MODEL
 from paper_pen import pen_grip
 from paper_writing import WritingSession, paper_bounds
 from rgb_preview import _capture
-
-
-def choose_camera(names, requested=None):
-    """(index, is LogiInsight) of the camera to use: the LogiInsight RGB stream, else the first webcam."""
-    if requested is not None:
-        return (requested, "lvnext" in names[requested].lower()) if 0 <= requested < len(names) else (None, False)
-    skip = ("cpd", "hello", " ir", "infrared", "virtual", "obs")
-    for wanted in (True, False):
-        for index, name in enumerate(names):
-            lower = name.lower()
-            if ("lvnext" in lower) == wanted and not any(part in lower for part in skip):
-                return index, wanted
-    return None, False
 
 
 def main():

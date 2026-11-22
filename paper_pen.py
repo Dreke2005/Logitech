@@ -92,7 +92,7 @@ def _barrels(mask, hue, saturation, paper_like, ink_width, widest, shortest, rea
     usable = np.asarray(usable)
     rows, cols = mask.shape
     found, taken = [], set()
-    for length, label, centre, axis, low, high, thickness in seeds[:6]:
+    for _, label, centre, axis, low, high, thickness in seeds[:6]:
         if label in taken:
             continue
         members, points = {label}, pixels(label)
@@ -147,7 +147,25 @@ def _barrels(mask, hue, saturation, paper_like, ink_width, widest, shortest, rea
     return found
 
 
-def _probe(frame, end, direction, width, cone_length=0.0):
+def capture_contains(point, shape, region=None, mask=None, margin=0):
+    """Whether a frame-coordinate point and its margin belong to the capture."""
+    height, width = shape[:2]
+    left, top, right, bottom = region if region is not None else (0, 0, width, height)
+    x, y = point
+    if not (max(0, left) + margin <= x < min(width, right) - margin
+            and max(0, top) + margin <= y < min(height, bottom) - margin):
+        return False
+    if mask is None:
+        return True
+    if mask.shape != (height, width):
+        return False
+    ix, iy = int(round(x)), int(round(y))
+    if not (margin <= ix < width - margin and margin <= iy < height - margin):
+        return False
+    return bool(mask[iy - margin:iy + margin + 1, ix - margin:ix + margin + 1].all())
+
+
+def _probe(frame, end, direction, width, cone_length=0.0, capture=None):
     """Follow the pen's body from a barrel end outward to where it stops.
 
     A strip of the frame along the pen is cut out, straightened. Row by row the body's cross-section
@@ -216,6 +234,10 @@ def _probe(frame, end, direction, width, cone_length=0.0):
                 break
             continue
         _, start, stop = found
+        # BORDER_REPLICATE is useful for sampling but contributes no real edge support.
+        if outside[row, max(0, start - 1):min(len(across), stop + 1)].any():
+            kind = "edge"
+            break
         if stop - start > 1.4 * measured + 2 or start == 0 or stop == len(across):
             covered += 1
             misses = 0
@@ -251,6 +273,18 @@ def _probe(frame, end, direction, width, cone_length=0.0):
     if kind is None:
         kind = "blunt" if taper < 0.35 * measured else "open"
         cone = (steps >= taper_start) & (widths >= 0.25 * measured) & (widths <= 0.85 * measured)
+        if capture is not None:
+            region, mask = capture
+            observed_end = end + direction * last + normal * middles[-1]
+            if not capture_contains(observed_end, frame.shape, region, mask, margin=2):
+                return tuple(float(v) for v in observed_end), "edge", measured, 0.0
+            # Measure the taper only from its two actually visible sides in the capture.
+            for index in np.flatnonzero(cone):
+                middle = end + direction * steps[index] + normal * middles[index]
+                half_section = normal * (0.5 * widths[index] + 1)
+                if not all(capture_contains(edge, frame.shape, region, mask)
+                           for edge in (middle - half_section, middle + half_section)):
+                    cone[index] = False
         fitted = False
         if np.count_nonzero(cone) >= 4:
             slope, intercept = np.polyfit(steps[cone], widths[cone], 1)
@@ -270,7 +304,7 @@ def _probe(frame, end, direction, width, cone_length=0.0):
             # The point rests on dark writing (it points at it), which hides its outline. Where the barrel
             # starts to narrow is still seen, and the point lies as far from there as it always does.
             reach = taper_start + cone_length
-        if (fitted or (on_ink and cone_length > 0)) and reach - taper_start >= 0.7 * measured:
+        if fitted and reach - taper_start >= 0.7 * measured:
             kind = "point"
             seen = 0.0 if on_ink else reach - taper_start
         elif on_ink:
@@ -314,7 +348,7 @@ def find_bars(frame, region=None, scale=0.5):
     widest = 0.018 * frame.shape[1] * scale
     bars = []
     for mask in (coloured, black):
-        for points, centre, axis, low, high, thickness in _barrels(
+        for _, centre, axis, low, high, _ in _barrels(
                 mask, hue if mask is coloured else None, saturation, paper_like, INK_WIDTH, widest,
                 22 * scale * 2, 140 * scale):
             ends = (centre + np.outer((low, high), axis)) / scale + origin
@@ -322,7 +356,7 @@ def find_bars(frame, region=None, scale=0.5):
     return bars
 
 
-def find_pen(frame, region=None, hands=(), scale=0.5, colour=None, previous=None, ignore=(), inside=None):
+def find_pen(frame, region=None, hands=(), scale=0.5, colour=None, previous=None, ignore=(), inside=None, surface=None):
     """The pen in the frame, found by its barrel: an elongated, coloured (or black), non-skin shape.
 
     The hand model often misses a hand reaching in from the far side of the desk, and its landmarks
@@ -332,7 +366,8 @@ def find_pen(frame, region=None, hands=(), scale=0.5, colour=None, previous=None
     to a point on the paper, on the short side of the grip, away from the wrist, and where it was in
     ``previous`` (the PenEnd of the frame before). ``ignore`` lists the ends of bars that lay in the
     picture before anyone held a pen (``find_bars``): a bar still lying exactly there is not the pen.
-    ``inside`` is a box (x0, y0, x1, y1) one end of the pen must be in: the sheet being written on.
+    ``inside`` and ``surface`` constrain the nib and its observed taper edges. The shaft can extend
+    outside the writing area so it can still establish the orientation of a pen at the page margin.
     Returns a PenEnd, or None.
     """
     width = frame.shape[1]
@@ -347,10 +382,9 @@ def find_pen(frame, region=None, hands=(), scale=0.5, colour=None, previous=None
              for hand in hands or () if hand.get("fingertips") and "thumb" in hand["fingertips"]
              and "index" in hand["fingertips"]]
     wrists = [np.asarray(hand["landmarks"][0]["pixel"], float) for hand in hands or () if hand.get("landmarks")]
-    candidates = []
+    estimated = None
     for mask, weight in ((coloured, 1.0), (black, 0.7)):
-        if mask is black and candidates:
-            break  # A coloured barrel is far more reliable than a dark shape.
+        candidates = []
         for points, centre, axis, low, high, thickness in _barrels(
                 mask, hue if mask is coloured else None, saturation, paper_like, ink_width, widest,
                 22 * scale * 2, 140 * scale):
@@ -359,9 +393,6 @@ def find_pen(frame, region=None, hands=(), scale=0.5, colour=None, previous=None
                 continue
             length = high - low
             ends = (centre + np.outer((low, high), axis)) / scale + origin
-            if inside is not None and not any(inside[0] <= x < inside[2] and inside[1] <= y < inside[3]
-                                              for x, y in ends):
-                continue
             if any(min(max(np.linalg.norm(ends[0] - a), np.linalg.norm(ends[1] - b)),
                        max(np.linalg.norm(ends[0] - b), np.linalg.norm(ends[1] - a))) <= 8 for a, b in ignore):
                 continue  # Lying where it lay before the recording: a cable, a ruler, a pen put down.
@@ -401,18 +432,27 @@ def find_pen(frame, region=None, hands=(), scale=0.5, colour=None, previous=None
             for x, y in (centre + np.outer((low, high), axis)).astype(int):
                 around.append(int(skin[max(0, y - reach):y + reach + 1, max(0, x - reach):x + reach + 1].sum()))
             candidates.append((score, match, ends, thickness / scale, shade, held, mask is coloured, grip_at, around))
-    if not candidates:
-        return None
-    # With a known colour, only shapes of that colour count when there is one. When none matches (another
-    # pen, or a colour learned wrongly), the colour is ignored rather than losing the pen altogether.
-    matching = [item for item in candidates if item[1] >= 0.45]
-    pool = [(item[0] * item[1],) + item[1:] for item in matching] if matching else candidates
-    score, _, ends, thickness, shade, held, is_coloured, grip_at, around = max(pool, key=lambda item: item[0])
+        # Try the learned colour first, then the other barrels in case the pen has changed.
+        candidates.sort(key=lambda item: (item[1] >= 0.45, item[0] * (item[1] if item[1] >= 0.45 else 1.0)),
+                        reverse=True)
+        for _, _, ends, thickness, shade, held, is_coloured, grip_at, around in candidates:
+            result = _evaluate_barrel(frame, ends, thickness, wrists, held, shade, is_coloured, grip_at, around,
+                                      previous, inside, surface)
+            if result is not None:
+                if result.tapered:
+                    return result
+                if estimated is None:
+                    estimated = result
+    return estimated
+
+
+def _evaluate_barrel(frame, ends, thickness, wrists, held, shade, is_coloured, grip_at, around, previous,
+                     inside, surface):
     outward = (ends[0] - ends[1]) / max(float(np.linalg.norm(ends[0] - ends[1])), 1.0)
     known = previous.cone if previous is not None else 0.0
     probes = [_probe(frame, ends[0], outward, thickness, known), _probe(frame, ends[1], -outward, thickness, known)]
     votes = []
-    for index, (tip, kind, _, _) in enumerate(probes):
+    for index, (_, kind, _, _) in enumerate(probes):
         vote = {"point": 1.2, "blunt": -0.6, "edge": -1.0}.get(kind, 0.0)
         if grip_at is not None:
             # The fingers hold a pen near its point: the nib is the end on the short side of the grip.
@@ -431,6 +471,13 @@ def find_pen(frame, region=None, hands=(), scale=0.5, colour=None, previous=None
         votes.append(vote)
     nib = int(np.argmax(votes))
     tip, kind, measured, seen = probes[nib]
+    if kind == "edge" or not capture_contains(tip, frame.shape, inside, surface, margin=2):
+        return None  # An exterior nib does not turn the opposite end into a candidate.
+    if kind == "point" and (inside is not None or surface is not None):
+        direction = outward if nib == 0 else -outward
+        tip, kind, measured, seen = _probe(frame, ends[nib], direction, thickness, known, (inside, surface))
+        if kind == "edge" or not capture_contains(tip, frame.shape, inside, surface, margin=2):
+            return None
     back = ends[1 - nib]
     # The cone's length as seen whole on plain paper, steadied over the frames (see _probe).
     cone = known if seen <= 0 else (seen if known <= 0 else 0.7 * known + 0.3 * seen)
@@ -438,13 +485,14 @@ def find_pen(frame, region=None, hands=(), scale=0.5, colour=None, previous=None
                   float(max(thickness, 0.8 * measured)), shade, held, is_coloured, kind == "point", cone)
 
 
-def locate_pen(frame, grip, wrist, radius):
+def locate_pen(frame, grip, wrist, radius, inside=None, surface=None):
     """Find a narrow pen shaft aligned with the grip, then estimate its exposed endpoint."""
     height, width = frame.shape[:2]
+    x0, y0, x1, y1 = map(int, inside) if inside is not None else (0, 0, width, height)
     x, y = grip
     reach = max(28, round(1.4 * radius))
-    left, top = max(0, x - reach), max(0, y - reach)
-    right, bottom = min(width, x + reach + 1), min(height, y + reach + 1)
+    left, top = max(0, x0, x - reach), max(0, y0, y - reach)
+    right, bottom = min(width, x1, x + reach + 1), min(height, y1, y + reach + 1)
     if right - left < 15 or bottom - top < 15:
         return None
     patch = frame[top:bottom, left:right]
@@ -486,11 +534,15 @@ def locate_pen(frame, grip, wrist, radius):
             break
     if best is None or best[0] < 0.40:
         return None
-    tip = _centered_endpoint(patch, best[1], best[2], radius)
-    return tuple(np.rint(tip + (left, top)).astype(int)) if tip is not None else None
+    mask = surface[top:bottom, left:right].astype(np.uint8, copy=False) if surface is not None else None
+    tip = _centered_endpoint(patch, best[1], best[2], radius, mask)
+    if tip is None:
+        return None
+    result = tuple(np.rint(tip + (left, top)).astype(int))
+    return result if capture_contains(result, frame.shape, inside, surface, margin=2) else None
 
 
-def _centered_endpoint(patch, end, axis, radius):
+def _centered_endpoint(patch, end, axis, radius, mask=None):
     """Walk across the shaft's center toward the narrow tip until foreground ends."""
     normal = np.array((-axis[1], axis[0]))
     along = np.arange(-max(9, round(radius * 0.38)), max(9, round(radius * 0.50)) + 1)
@@ -500,12 +552,17 @@ def _centered_endpoint(patch, end, axis, radius):
     gray = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
     strip = cv2.remap(gray, grid[:, :, 0].astype(np.float32), grid[:, :, 1].astype(np.float32),
                       cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=255)
+    valid = None if mask is None else cv2.remap(
+        mask, grid[:, :, 0].astype(np.float32), grid[:, :, 1].astype(np.float32), cv2.INTER_NEAREST,
+        borderMode=cv2.BORDER_CONSTANT, borderValue=0)
     background = np.median(np.c_[strip[:, :2], strip[:, -2:]], axis=1)
     foreground = strip < np.minimum(196, background - 20)[:, None]
     center, width, misses, last = 0.0, None, 0, None
-    for step, row in zip(along, foreground):
+    for sample, (step, row) in enumerate(zip(along, foreground)):
         x, y = end + step * axis + center * normal
         if not (0.5 <= x < gray.shape[1] - 1 and 0.5 <= y < gray.shape[0] - 1):
+            return None
+        if valid is not None and not valid[sample, int(round(center)) + half]:
             return None
         edges = np.flatnonzero(np.diff(np.r_[False, row, False]))
         runs = [(across[start], across[stop - 1]) for start, stop in edges.reshape(-1, 2)]
@@ -518,6 +575,8 @@ def _centered_endpoint(patch, end, axis, radius):
                 return last[1] if last[0] >= -max(5, radius * 0.15) else None
             continue
         first, last_pixel = min(nearby, key=lambda run: abs(np.mean(run) - center))
+        if valid is not None and not valid[sample, first + half - 1:last_pixel + half + 2].all():
+            return None
         center = (first + last_pixel) / 2
         span = last_pixel - first + 1
         width = span if width is None else (0.75 * width + 0.25 * span)
@@ -693,7 +752,7 @@ def pen_grip(hand):
     return grip, rest, int(np.clip(size * 0.7, 24, 100)), max(float(scale), 8.0)
 
 
-def estimate_pen_tip(hand, frame=None, bias=(0.0, 0.0)):
+def estimate_pen_tip(hand, frame=None, bias=(0.0, 0.0), inside=None, surface=None):
     """Place a landmark at the pen tip rather than the index fingertip.
 
     The geometric estimate continues the rest-to-grip pen axis past the grip by about a
@@ -710,11 +769,11 @@ def estimate_pen_tip(hand, frame=None, bias=(0.0, 0.0)):
     estimate = grip + axis * scale * (0.28 + bias[0]) + normal * scale * bias[1]
     grip_point = tuple(int(v) for v in np.rint(grip))
     if frame is not None:
-        seen = locate_pen(frame, grip_point, tuple(int(v) for v in np.rint(rest)), radius)
+        seen = locate_pen(frame, grip_point, tuple(int(v) for v in np.rint(rest)), radius, inside, surface)
         if seen is not None and np.linalg.norm(np.subtract(seen, estimate)) <= max(radius * 0.9, scale * 0.35):
             return PenTip(tuple(int(v) for v in seen), grip_point, radius, scale, True)
-        height, width = frame.shape[:2]
-        estimate = np.clip(estimate, 0, (width - 1, height - 1))
+        if not capture_contains(np.rint(estimate), frame.shape, inside, surface):
+            return None
     return PenTip(tuple(int(v) for v in np.rint(estimate)), grip_point, radius, scale, False)
 
 
@@ -749,9 +808,9 @@ class PenTipTracker:
     def __init__(self):
         self.filters, self.bias = {}, {}
 
-    def update(self, side, hand, frame, now):
+    def update(self, side, hand, frame, now, inside=None, surface=None):
         bias = self.bias.get(side, np.zeros(2))
-        tip = estimate_pen_tip(hand, frame, bias)
+        tip = estimate_pen_tip(hand, frame, bias, inside, surface)
         if tip is None:
             return None
         if tip.visual:
@@ -763,4 +822,7 @@ class PenTipTracker:
                 observed = np.array((offset @ axis, offset @ np.array((-axis[1], axis[0]))))
                 self.bias[side] = np.clip(0.8 * bias + 0.2 * observed, -0.3, 0.3)
         smooth = self.filters.setdefault(side, OneEuro())(now, tip.point)
-        return PenTip(tuple(int(v) for v in np.rint(smooth)), tip.grip, tip.radius, tip.scale, tip.visual)
+        point = tuple(int(v) for v in np.rint(smooth))
+        if frame is not None and not capture_contains(point, frame.shape, inside, surface):
+            point = tip.point
+        return PenTip(point, tip.grip, tip.radius, tip.scale, tip.visual)

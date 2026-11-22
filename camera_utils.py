@@ -36,6 +36,19 @@ class CameraNotFoundError(RuntimeError):
     """No usable camera. The message includes OS-specific things to check."""
 
 
+def choose_rgb_camera(names, requested=None):
+    """Choose the LogiInsight RGB device or an ordinary webcam by DirectShow index."""
+    if requested is not None:
+        return (requested, "lvnext" in names[requested].lower()) if 0 <= requested < len(names) else (None, False)
+    skip = ("cpd", "hello", " ir", "infrared", "virtual", "obs")
+    for wanted in (True, False):
+        for index, name in enumerate(names):
+            lower = name.lower()
+            if ("lvnext" in lower) == wanted and not any(part in lower for part in skip):
+                return index, wanted
+    return None, False
+
+
 # --------------------------------------------------------------------------- #
 # Backends / opening
 # --------------------------------------------------------------------------- #

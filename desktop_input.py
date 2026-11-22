@@ -48,8 +48,7 @@ class WindowsInput:
         self._user32.SendInput.restype = wt.UINT
         self._user32.GetAsyncKeyState.argtypes = (ct.c_int,)
         self._user32.GetAsyncKeyState.restype = ct.c_short
-        self._shortcut_was_held = False
-        self._shortcut_releasing = False
+        self._shortcuts = {}
         self._navigation = None
 
     def _send(self, events, recovery=()):
@@ -69,13 +68,21 @@ class WindowsInput:
 
     def poll_pause_shortcut(self):
         """Return (just pressed, currently held) for global Ctrl+Alt+F8."""
-        keys_down = [self._is_held(code) for code in (KEYS["ctrl"], KEYS["alt"], 0x77)]
+        return self._poll_shortcut(0x77)
+
+    def poll_mode_shortcut(self):
+        """Return (just pressed, still releasing) for global Ctrl+Alt+F9."""
+        return self._poll_shortcut(0x78)
+
+    def _poll_shortcut(self, function_key):
+        keys_down = [self._is_held(code) for code in (KEYS["ctrl"], KEYS["alt"], function_key)]
         held = all(keys_down)
-        pressed = held and not self._shortcut_was_held
-        self._shortcut_was_held = held
+        was_held, releasing = self._shortcuts.get(function_key, (False, False))
+        pressed = held and not was_held
         # Wait for the physical modifiers to come up before sending an event.
-        self._shortcut_releasing = held or (self._shortcut_releasing and any(keys_down))
-        return pressed, self._shortcut_releasing
+        releasing = held or (releasing and any(keys_down))
+        self._shortcuts[function_key] = held, releasing
+        return pressed, releasing
 
     def move_to(self, x, y):
         x, y = (round(65535 * min(1, max(0, value))) for value in (x, y))

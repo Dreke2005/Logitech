@@ -2,6 +2,7 @@ import hermetic  # noqa: F401
 import json
 import tempfile
 import unittest
+from dataclasses import replace
 from io import BytesIO
 from pathlib import Path
 from unittest.mock import patch
@@ -166,6 +167,25 @@ class PaperConversionTests(unittest.TestCase):
         with patch("paper_conversion.chat", return_value=reply):
             result = convert_page(frame, "KiCad", None, "local")
         self.assertEqual((result.content, result.notes), ("", ("Unclear junction",)))
+
+    def test_recorded_circuit_uses_aligned_ink_and_keeps_shared_labels_consistent(self):
+        frame = np.full((60, 120, 3), 210, dtype=np.uint8)
+        ink = np.full_like(frame, 255)
+        ink[15:35, 40:80] = 0
+        reply = {"source": "V1 and D1", "notes": [], "directive": "", "components": [
+            {"reference": "V1", "value": "5V", "nets": ["IN", "GND"]},
+            {"reference": "D1", "value": "D", "nets": ["in", "ground"]},
+        ]}
+        with patch("paper_conversion.chat", return_value=reply) as reader:
+            draft = convert_page(frame, "KiCad", None, "local", evidence=ink)
+        self.assertEqual(reader.call_count, 1)
+        self.assertIn("aligned to it", reader.call_args.args[2])
+        self.assertIn("Preserve open terminals", reader.call_args.args[2])
+        decoded = [cv2.imdecode(np.frombuffer(reader.call_args.kwargs[key], np.uint8), cv2.IMREAD_COLOR)
+                   for key in ("image", "evidence")]
+        self.assertEqual(decoded[0].shape, decoded[1].shape)
+        self.assertEqual(draft.content.count("\nIN\n"), 2)
+        self.assertIn("L Device:D D1", draft.content)
 
     def test_matlab_solver_uses_the_transcribed_equation_and_selected_task(self):
         frame = np.zeros((40, 60, 3), dtype=np.uint8)
@@ -391,6 +411,15 @@ class TraceFirstReadingTests(unittest.TestCase):
             reading = read_recording(_recorded(_equation_strokes()[:1]), "LaTeX", "Python", "equation", "local")
         self.assertEqual((model.call_count, reading.path), (1, "visual"))
         self.assertIn("evidence", model.call_args.kwargs)
+
+    def test_rejected_fast_ink_cannot_bypass_semantic_validation(self):
+        recorded = _recorded()
+        recorded = replace(recorded, ink=recorded.evidence)
+        with patch("paper_conversion.paper_reader.decipher", return_value=("y = = x", (), False)), \
+                patch("paper_conversion.chat", return_value=self.reply("y = x^2")) as model:
+            reading = read_recording(recorded, "LaTeX", "Python", "equation", "local", cloud=False)
+        self.assertEqual((model.call_count, reading.source), (1, "y = x^2"))
+        self.assertTrue(any("Fast reading rejected" in note for note in reading.notes))
 
     def test_upside_down_writing_is_turned_upright(self):
         strokes = [np.c_[1000 - stroke[:, 0], 800 - stroke[:, 1]]

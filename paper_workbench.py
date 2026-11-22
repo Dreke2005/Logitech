@@ -26,6 +26,7 @@ from fingertip_tracker import DEFAULT_MODEL
 from local_model import MODEL, warm_up
 from paper_camera_ai import CameraAI
 from paper_camera_check import choose_camera
+from desktop_input import WindowsInput
 from paper_check import check_derivation
 from paper_context import end_circle_enabled, project_hints, validate_reading, writing_context
 from paper_conversion import (
@@ -68,6 +69,7 @@ from paper_sheet import SheetCalibration
 from paper_snapshot import find_paper, snapshot_region
 from paper_writing import WritingSelection, WritingSession, paper_bounds
 from rgb_preview import _capture
+from workspace_modes import acknowledge_notes, notes_command, request_notes, workspace_active
 
 
 
@@ -96,7 +98,7 @@ def _read_tracked(bench, selected, target, language, workflow, model):
     live = getattr(bench, "live", None)
     # With the cloud setting the finished writing is read by Claude; the local preview is not reused.
     if live is not None and _signature(selected)[0] and not paper_cloud.enabled():
-        key = (_signature(selected), target, workflow)
+        key = (getattr(bench, "writing_started", None), _signature(selected), target, language, workflow)
         thread = live.get("thread")
         if live.get("pending") == key and thread is not None and thread.is_alive():
             thread.join(timeout=40)
@@ -138,6 +140,10 @@ class PaperWorkbench:
         self.dialog_open = False
         self.preview_live = False
         self.camera_failed = False
+        self.workspace_command = None
+        self.workspace_workflow = None
+        self.workspace_process = None
+        self.workspace_hotkey = WindowsInput() if os.name == "nt" else None
         self.pasted = False
         self.preview_update = 0
         self.last_app = "vscode"  # The app page used last; version control acts on its project.
@@ -324,7 +330,7 @@ class PaperWorkbench:
         if self.dialog_open:
             return
         if self.busy:
-            if menu == self.menu and {"code": "default", "graph": "graph", "project": "project",
+            if menu == self.menu and {"code": "default", "graph": "graph", "project": "project", "circuit": "circuit",
                                       "equation": "equation", "table": "table", "flow": "flow", "image": "image",
                                       "issue": "forge_issue", "request": "forge_request", "gantt": "gantt",
                                       "diagram": "diagram"}.get(action) == self.workflow:
@@ -407,12 +413,12 @@ class PaperWorkbench:
             "browse": self.browse_report, "overleaf": self.open_overleaf, "simulate": self.simulate,
         }
         workflows = {"code": "default", "equation": "equation", "project": "project",
-                     "brief": "idea", "circuit": "default", "graph": "graph"}
+                     "brief": "idea", "circuit": "circuit", "graph": "graph"}
         if action == "languages":
             self.languages = True
             self.writing_workflow = None
             self._show_menu()
-        elif action in ("code", "graph", "project", "equation", "table"):
+        elif action in ("code", "graph", "project", "equation", "table", "circuit"):
             self.writing_action(workflows.get(action, action))
         elif action in handlers:
             if action in ("photo", "copy", "paste"):
@@ -492,8 +498,8 @@ class PaperWorkbench:
 
     def start_from_webcam(self):
         """The webcam key on the start page: camera on, pen tracking running, and the apps shown."""
-        self.start_camera()
         self.select("home")
+        self.start_camera()
         if self.camera:
             self.status.set("Webcam on, tracking the pen. Choose an app.")
 
@@ -540,7 +546,70 @@ class PaperWorkbench:
         else:
             self.start_camera()
 
+    def request_notes_camera(self, resume=None):
+        state = workspace_active()
+        if state is None or state["notes_enabled"]:
+            return False
+        if resume is not None:
+            self.workspace_workflow = self.menu, resume
+        try:
+            request_notes(state)
+        except OSError as error:
+            self.workspace_workflow = None
+            self.status.set(f"Could not switch to note writing: {error}")
+        else:
+            self.status.set("Switching to note writing. Wait for the camera to be ready.")
+        return True
+
+    def follow_workspace(self):
+        command = notes_command(self.keypad.id)
+        if command is not None and command["id"] != self.workspace_command:
+            if command["action"] == "stop":
+                if not self.stop_camera():
+                    return
+            else:
+                device = command.get("device")
+                if type(device) is int and self.camera is None:
+                    self.args.camera = device
+                if self.menu == "start":
+                    self.start_from_webcam()
+                else:
+                    self.start_camera()
+                self.window.deiconify()
+                self.window.lift()
+            try:
+                acknowledge_notes(command, self.camera is not None)
+            except OSError:
+                return
+            self.workspace_command = command["id"]
+            if command["action"] == "start":
+                pending, self.workspace_workflow = self.workspace_workflow, None
+                if pending and pending[0] == self.menu and self.camera is not None:
+                    pending[1]()
+        if self.workspace_process is not None:
+            result = self.workspace_process.poll()
+            if result is not None:
+                self.workspace_process = None
+                if result:
+                    self.status.set("The camera workspace stopped before completing the mode switch.")
+        if self.workspace_hotkey is None:
+            return
+        pressed, _ = self.workspace_hotkey.poll_mode_shortcut()
+        if not pressed or workspace_active():
+            return
+        if self.workspace_process is not None and self.workspace_process.poll() is None:
+            return
+        command_line = [sys.executable, str(Path(__file__).with_name("rgb_preview.py")), "--mode", "workspace"]
+        if self.args.camera is not None:
+            command_line.extend(("--device", str(self.args.camera)))
+        try:
+            self.workspace_process = subprocess.Popen(command_line, creationflags=subprocess.CREATE_NO_WINDOW)
+        except OSError as error:
+            self.status.set(f"Could not open the camera workspace: {error}")
+
     def start_camera(self):
+        if self.request_notes_camera():
+            return
         if self.camera:
             self.preview_live = True
             return
@@ -567,6 +636,8 @@ class PaperWorkbench:
             self.sheet_calibration.start()
             self.writing = WritingSession()
             self.writing_area = None
+            self.sheet = self.sheet_bounds = None
+            self.recent_frames.clear()
             self.page_pinned = False
             self.camera = process, output, stop, time.monotonic()
             # Load both models while the camera starts, so the first reading is as fast as the rest.
@@ -590,13 +661,17 @@ class PaperWorkbench:
             if process.is_alive():
                 process.terminate()
                 process.join(timeout=1)
+                if process.is_alive():
+                    return False
             output.close()
             self.camera = None
             self.frame = None
             self.preview_live = False
             self.pending_capture = None
             self.writing_workflow = None
+            self.finish_wait = None
             self.render_buttons()
+        return True
 
     def resume_live(self):
         self.roi = None
@@ -636,9 +711,10 @@ class PaperWorkbench:
             if roi[2] - roi[0] > 30 and roi[3] - roi[1] > 30:
                 self.writing_area = roi
                 if self.writing_workflow and self.frame is not None:
-                    self.writing = WritingSession(self.frame, roi)
+                    self.begin_writing_frame()
                     self.status.set("Writing area set. Write now, then move your writing hand away.")
                 else:
+                    self.writing.area = roi
                     self.status.set("Writing area set. Press Code or Plot before writing.")
             return
         self.roi = roi if roi[2] - roi[0] > 8 and roi[3] - roi[1] > 8 else None
@@ -707,12 +783,24 @@ class PaperWorkbench:
             rotation = self.writer_rotation
         if pointed and self.roi is None and not marked_only:
             tip = self.writing.pointer(now)
-            if tip is None and self.writing.pen_rotation(now) is not None:
-                tip = self.writing.pen.point  # The nib, even off the detected sheet.
+            area = self.writing_area or self.writing.area
             # The pen points at the writing just in front of its point; that block is read.
             pen = self.writing.pen if self.writing.pen_rotation(now) is not None else None
-            ahead = np.subtract(pen.point, pen.back) if pen is not None else None
+            if tip is None and pen is not None:
+                tip = pen.point
+            if tip is not None and area is not None and not (
+                    area[0] <= tip[0] < area[2] and area[1] <= tip[1] < area[3]):
+                tip = None
+            ahead = np.subtract(pen.point, pen.back) if pen is not None and tip is not None else None
             bounds, reason = snapshot_region(self.page, tip, self.writing.hidden_mask(self.page.shape), ahead)
+            if area is not None:
+                x0, y0, x1, y1 = bounds
+                left, top, right, bottom = area
+                limited = max(x0, left), max(y0, top), min(x1, right), min(y1, bottom)
+                if limited[2] - limited[0] < 8 or limited[3] - limited[1] < 8 or reason == "frame":
+                    bounds, reason = area, "area"
+                else:
+                    bounds = limited
             self.snapshot_reason = reason
             writing = WritingSelection(select_paper_region(self.page, bounds), rotation=rotation)
             self.show_selection(writing.page, tip)
@@ -737,7 +825,7 @@ class PaperWorkbench:
         """Keep what a reading is based on, to check a demo afterwards: ROOT/debug/<time>-<kind>/ with the
         frame (ink in blue, pen tip, chosen region in green), the crop, the ink, and the reading (see
         debug_result). Only the newest records are kept."""
-        if selected is None or self.page is None:
+        if not getattr(self.args, "debug_capture", False) or selected is None or self.page is None:
             return
         try:
             now = time.monotonic()
@@ -946,9 +1034,12 @@ class PaperWorkbench:
         self.source.insert("1.0", text)
 
     def writing_action(self, workflow):
-        if (not self.camera and not self.page_pinned and self.roi is None and self.page is None
+        if (not self.camera and not self.page_pinned and self.roi is None
                 and not (workflow == "graph" and self.pasted)):
-            self.start_camera()  # One key press: the action key starts the camera when it is off.
+            if self.request_notes_camera(partial(self.writing_action, workflow)):
+                return
+            if self.page is None:
+                self.start_camera()  # One key press: the action key starts the camera when it is off.
         if not self.camera or self.page_pinned or self.roi is not None or (workflow == "graph" and self.pasted):
             self.convert(workflow)
             return
@@ -973,6 +1064,7 @@ class PaperWorkbench:
         self.preview_live = True
         self.pending_capture = None
         purpose = {"default": "code", "graph": "a plot", "project": "a project", "equation": "an equation",
+                   "circuit": "a circuit",
                    "git_repo": "a repository idea", "git_branch": "a branch name",
                    "git_commit": "a commit message", "diagram": "a branch diagram",
                    "git_auto": "a branch diagram or a commit message",
@@ -1022,13 +1114,14 @@ class PaperWorkbench:
         # Branch diagrams and copy marks contain circles, so a circle must not end those recordings.
         previous = self.writing
         self.writing = WritingSession(self.frame, area,
-                                      end_circle=end_circle_enabled(self.writing_workflow, self.target),
+                                      end_circle=self.writing_workflow != "circuit"
+                                      and end_circle_enabled(self.writing_workflow, self.target),
                                       settle=1.6 if self.writing_workflow == "git_auto" else 0.9, sheet=sheet)
         self.writing.pen, self.writing.pen_seen = previous.pen, previous.pen_seen  # Keep following the same pen.
         if sheet is not None:
             self.sheet, self.sheet_bounds = sheet, area
         # Every frame and hand sample of this recording, so it can be replayed offline (paper_replay.py).
-        self.recorder = Recorder(self.frame, area, sheet)
+        self.recorder = Recorder(self.frame, area, sheet) if getattr(self.args, "debug_capture", False) else None
 
     def _points_at_writing(self):
         """True when the pen's point rests at writing that is already on the page."""
@@ -1101,8 +1194,8 @@ class PaperWorkbench:
             if reading.source and self.writing_workflow and not self.busy:
                 self.status.set(f"Reading so far: {' '.join(reading.source.split())[:110]}")
         thread = live["thread"]
-        if self.writing_workflow == "image":
-            return  # A drawing for ChatGPT is not read at all.
+        if self.writing_workflow in ("image", "circuit"):
+            return  # These actions need the complete drawing rather than a text preview.
         if (self.busy or self.writing.reference is None or (thread is not None and thread.is_alive())
                 or now - live["at"] < 0.8):
             return
@@ -1113,7 +1206,7 @@ class PaperWorkbench:
         selected = self.writing._select_recording(self.frame, None, follow_sheet=False)  # Fast preview.
         if selected is None or not (ink_usable(selected) or trace_usable(selected.strokes)):
             return
-        key = (_signature(selected), self.target, self.writing_workflow)
+        key = (self.writing_started, _signature(selected), self.target, self.language, self.writing_workflow)
         if key == live["key"]:
             return
         live["pending"] = key
@@ -1146,21 +1239,26 @@ class PaperWorkbench:
         tips, down = self.writing.summary()
         bounds = self.writing.motion_bounds((self.frame.shape[1], self.frame.shape[0]))
         self.writing_workflow = None
+        if bounds is None:
+            self.status.set("No writing area detected. Write again or select the writing on a captured page.")
+            self.key_result = ("error", now)
+            return
         self.page, self.roi, self.preview_live = self.frame.copy(), bounds, False
         chosen = self.capture_selection(workflow)
         self.roi = None  # The region belongs to this one reading; the next key press records again.
         if chosen is None:
             return
         self.generate_selection(workflow, chosen)
-        where = "the area where you wrote" if bounds else "the whole page"
         self.status.set(f"No pen strokes were registered ({tips} pen-tip samples, {down} on ink), so a photo of "
-                        f"{where} is being read...")
+                        "the area where you wrote is being read...")
 
     def convert(self, workflow):
         if self.busy or self.target is None:
             return
         pasted_plot = workflow == "graph" and self.pasted
         if not pasted_plot and self.camera is None and self.page is None:
+            if self.request_notes_camera(partial(self.convert, workflow)):
+                return
             self.start_camera()
         if not pasted_plot and self.preview_live and self.frame is None:
             self.pending_capture = self.menu, workflow
@@ -1196,16 +1294,32 @@ class PaperWorkbench:
                daemon=True).start()
 
     def sharpest_frame(self, within=1.2):
-        """The sharpest frame of the last ``within`` seconds (variance of the Laplacian), else the latest."""
+        """Prefer a sharp view of the same paper without reusing an older page or pose."""
+        area = self.writing_area or self.writing.area or self.sheet_bounds
+        if area is None:
+            return self.frame
+        x0, y0, x1, y1 = area
+
+        def sample(frame):
+            crop = frame[y0:y1, x0:x1]
+            if min(crop.shape[:2]) < 12:
+                return None
+            return cv2.cvtColor(cv2.resize(crop, None, fx=0.25, fy=0.25, interpolation=cv2.INTER_AREA),
+                                cv2.COLOR_BGR2GRAY)
+
+        reference = sample(self.frame)
+        if reference is None:
+            return self.frame
         now = time.monotonic()
-        best, chosen = None, self.frame
+        best, chosen = float(cv2.Laplacian(reference, cv2.CV_32F).var()), self.frame
         for when, frame in self.recent_frames:
             if now - when > within or frame.shape != self.frame.shape:
                 continue
-            small = cv2.cvtColor(cv2.resize(frame, None, fx=0.25, fy=0.25, interpolation=cv2.INTER_AREA),
-                                 cv2.COLOR_BGR2GRAY)
+            small = sample(frame)
+            if small is None or np.mean(cv2.absdiff(small, reference) > 24) > 0.12:
+                continue
             sharpness = float(cv2.Laplacian(small, cv2.CV_32F).var())
-            if best is None or sharpness > best:
+            if sharpness > best:
                 best, chosen = sharpness, frame
         return chosen
 
@@ -1246,7 +1360,7 @@ class PaperWorkbench:
         page = evidence = None
         if getattr(selected, "page", None) is not None:
             # A snapshot is read upright for the writer (see selected_page); a recording turns its own ink.
-            turn = getattr(selected, "rotation", 0) if not recorded else 0
+            turn = getattr(selected, "rotation", 0) if not recorded or workflow == "circuit" else 0
             orchestrated = paper_cloud.enabled() and paper_orchestrator.key_for(target, workflow, language)
             if not recorded and workflow in self.CONFIRMED and not orchestrated:
                 # (The orchestrator reads a turned picture as it is, so no reading is spent on finding the turn.)
@@ -1309,6 +1423,9 @@ class PaperWorkbench:
                                                      evidence=evidence, key=("Git", language, workflow))
                 draft = (convert_transcription(source, notes, "VS Code", language, self.args.model, "project")
                          if workflow == "git_repo" else Draft(source, source, notes, ".txt"))
+            elif workflow == "circuit" and target in ("LTspice", "KiCad"):
+                draft = convert_page(page, target, language, self.args.model, workflow, evidence=evidence,
+                                     check=self._circuit_check)
             elif recorded or (workflow in ("default", "equation") and target in ("VS Code", "MATLAB", "LaTeX")):
                 if recorded:
                     source, notes = _read_tracked(self, selected, target, language, workflow, self.args.model)
@@ -2439,6 +2556,7 @@ class PaperWorkbench:
             self.status.set(f"Git: {error}")
 
     def tick(self):
+        self.follow_workspace()
         for slot in self.keypad.presses():
             if isinstance(slot, tuple):
                 self.dispatch(*slot)
@@ -2567,7 +2685,7 @@ class PaperWorkbench:
                                     "The simulation failed. " + " | ".join(lines[:3]))
                     if not ok:
                         self.key_result = ("error", now)
-                elif draft.content and self.target in ("LTspice", "KiCad") and workflow == "default":
+                elif draft.content and self.target in ("LTspice", "KiCad") and workflow in ("circuit", "default"):
                     self.open_circuit()
                 elif (getattr(self, "plan_actions", None) and "open_in_app" not in self.plan_actions
                       and workflow in ("default", "equation", "graph")):
@@ -2657,6 +2775,7 @@ def main():
     parser.add_argument("--webcam", action="store_true", help="Start the camera and show the apps (the webcam key)")
     parser.add_argument("--slot", type=int, choices=range(9), help=argparse.SUPPRESS)
     parser.add_argument("--background", action="store_true", help="Start minimized; results show as pop-ups")
+    parser.add_argument("--debug-capture", action="store_true", help="Save camera diagnostics and replay files")
     args = parser.parse_args()
     active = current_state()
     if active:

@@ -1,5 +1,23 @@
 # LogiInsight RGB preview
 
+## Switch between camera tools
+
+On Windows, start the integrated workspace with:
+
+```cmd
+uv run rgb_preview.py --mode workspace
+```
+
+**Ctrl+Alt+F9** cycles through virtual keyboard, touchpad, gaze, lip reading, and
+PaperBridge note writing. Use **Ctrl+Alt+F8** to enable or pause touchpad and gaze
+control, and **Space** to start or finish a phrase in lip-reading mode. Each mode
+gets its turn with the camera before the next mode starts. In the workspace, the
+MX Keypad’s webcam key can switch directly to PaperBridge. You can also start the
+workspace by pressing **Ctrl+Alt+F9** from the standalone PaperBridge workbench.
+
+See [silent transcription setup](silent_transcription_setup.md) for the optional
+lip-reading model and [PaperBridge](paper_workbench.md) for the keypad workflow.
+
 ## RGB preview with a tap keyboard (Command Prompt)
 
 From `C:\Users\andre\git\Logitech`:

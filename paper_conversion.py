@@ -319,11 +319,10 @@ def _cloud_reading(pictures, target, workflow, language, hints=(), previous=None
     if context.check == "copy":
         text = paper_reader._labelled(text)
     paper_cloud.note("cloud", seconds, "reading")
-    notes = [f"Read in the cloud (Claude) in {seconds:.1f} s."]
-    ok, reason = validate_reading(target, workflow, text, language)
+    ok, _ = validate_reading(target, workflow, text, language)
     if not ok:
-        notes.insert(0, f"Check this reading: {reason}.")
-    return Reading(text, notes, "cloud")
+        return None
+    return Reading(text, (f"Read in the cloud (Claude) in {seconds:.1f} s.",), "cloud")
 
 
 _STATIC_CACHE = {}
@@ -360,7 +359,7 @@ def _read_static(image, target, language, workflow, hints=(), cloud=True):
                                                        language, hints)
     except (RuntimeError, ValueError):
         return None
-    if not source:
+    if not source or not valid:
         return None
     return Reading(source, (*remarks, "Read from the ink found in the photo."), "ink")
 
@@ -573,8 +572,11 @@ def _read_recording(selection, target, language, workflow, model, hints, cloud):
                 getattr(selection, "rotation", 0))
         except (RuntimeError, ValueError):
             source = ""
-        if source:
+        if source and valid:
             return Reading(source, (*remarks, "Read from the ink registered while you wrote."), "ink")
+        if source:
+            _, reason = validate_reading(target, workflow, source, language)
+            rejected = (f"Fast reading rejected ({reason}). The recorded writing was read again.",)
     if context.reader == "ocr" and not ink_usable(selection) and not trace_usable(strokes):
         # A snapshot, or a recording without registered ink: lift the ink out of the photo crop.
         reading = read_static(selection.page.image, target, language, workflow, hints, cloud=False)
@@ -600,12 +602,12 @@ def _read_recording(selection, target, language, workflow, model, hints, cloud):
                 origin = "the ink registered while you wrote" if from_ink else "the recorded pen strokes"
                 path = "ink" if from_ink else "trace"
                 if checked is None:
-                    return Reading(source, (*notes, f"Read from {origin}."), path)
+                    return Reading(source, (*rejected, *notes, f"Read from {origin}."), path)
                 source, remark = checked
-                return Reading(source, (*notes, remark, f"Read from {origin}."), path + "+photo")
+                return Reading(source, (*rejected, *notes, remark, f"Read from {origin}."), path + "+photo")
             feedback = (source[:300], reason or "the strokes were unclear")
-        rejected = (f"The {'ink' if from_ink else 'pen-trace'} reading was rejected ({feedback[1]}), so the photo "
-                    "was read instead.",)
+        rejected = (*rejected, f"The {'ink' if from_ink else 'pen-trace'} reading was rejected ({feedback[1]}), "
+                               "so the photo was read instead.")
 
     rotation = getattr(selection, "rotation", 0)
     text_height = getattr(selection, "text_height", 0.0)
@@ -791,13 +793,15 @@ def build_schematic(parts):
 
 def _dangling_nets(components):
     """Net names used by exactly one pin (ground excluded)."""
-    counts = {}
+    counts, labels = {}, {}
     for part in components if isinstance(components, list) else ():
         nets = part.get("nets") if isinstance(part, dict) else None
         for net in nets if isinstance(nets, list) else ():
-            if isinstance(net, str):
-                counts[net.strip()] = counts.get(net.strip(), 0) + 1
-    return [net for net, count in counts.items() if count == 1 and net.lower() not in ("gnd", "0", "ground")]
+            if isinstance(net, str) and net.strip():
+                name = net.strip().casefold()
+                labels.setdefault(name, net.strip())
+                counts[name] = counts.get(name, 0) + 1
+    return [labels[net] for net, count in counts.items() if count == 1 and net not in KICAD_GROUND]
 
 
 CIRCUIT_PROMPT = (
@@ -812,12 +816,13 @@ CIRCUIT_PROMPT = (
     "net. Example: a source V1 whose + end is wired to R1, R1's other end to L1 at a node labelled "
     "mid, L1's other end to ground, and V1's - end to ground gives V1 [n1, GND], R1 [n1, mid], "
     "L1 [mid, GND]. Put a written simulation command such as .tran 10m in directive, or leave "
-    "directive empty. Always return a schematic that can be run and edited, with every assumption "
-    "listed in notes: number a part that has no reference (R1, R2, ...); give a part without a written "
-    "value a default (resistor 1k, capacitor 100n, inductor 1m, voltage source 5, current source 1m, "
-    "diode D); when no ground is drawn, name the net at the source's negative terminal GND; complete a "
-    "part or wire hidden by the hand as the simplest closed circuit. Return an empty components array "
-    "only when no circuit symbols can be made out at all.")
+    "directive empty. Label any clearly identified part without a reference (R1, R2, ...). A part whose value "
+    "is absent may get a default (resistor 1k, capacitor 100n, inductor 1m, voltage source 5, current source "
+    "1m, diode D); list each inserted value in notes. If the sketch has no ground, use GND for an otherwise "
+    "clearly identified source return only if it is unambiguous, and note the reference convention. "
+    "Preserve open terminals. Treat wire crossings as connected only when the drawing indicates a junction. "
+    "If a hidden part, wire, or ambiguous junction stops you from identifying the topology, return an empty "
+    "components array, retain the visible information in source, and describe the missing connection in notes.")
 
 
 def _circuit_schema():
@@ -834,23 +839,40 @@ def _circuit_schema():
     }, "required": ["source", "notes", "components", "directive"], "additionalProperties": False}
 
 
-def read_circuit(image, model, problem=None):
+def read_circuit(image, model, problem=None, *, evidence=None):
     """One reading of a circuit sketch: (source, notes, components, directive). In the cloud setting
     Claude reads the drawing; the local vision model is the fallback. A net that touches a single pin
-    cannot be right, so the wiring is then read once more. ``problem`` is (netlist, error) from a
-    simulator run that failed, for one corrected reading."""
+    is checked once more for a missed wire or an intentional open. ``problem`` is (netlist, error)
+    from a simulator run that failed, for one corrected reading."""
     schema, prompt = _circuit_schema(), CIRCUIT_PROMPT
+    options = {"image": image, "tokens": 1600, "large": True}
     if problem:
         prompt += (f" A previous reading gave this netlist:\n{problem[0][:800]}\nThe simulator rejected it: "
                    f"{problem[1][:300]} Look at the drawing again and correct the parts, values, or nets.")
-    reply = chat(model, SYSTEM, prompt, schema, image=image, tokens=1600, large=True)
+    photo_prompt = prompt
+    if evidence is not None:
+        prompt += (" The first image is the circuit crop; the second is the new ink aligned to it. "
+                   "Use the ink to locate strokes and the photo to verify wiring, polarity, and values.")
+        options["evidence"] = evidence
+    try:
+        reply = chat(model, SYSTEM, prompt, schema, **options)
+    except ModelOutputLimit:
+        if evidence is None:
+            raise
+        options.pop("evidence")
+        prompt = photo_prompt
+        reply = chat(model, SYSTEM, prompt, schema, **options)
     dangling = _dangling_nets(reply.get("components"))
     if dangling:
         retry = (f"{prompt} A previous reading left the net{'s' if len(dangling) > 1 else ''} "
-                 f"{', '.join(dangling)} connected to only one component pin, which is not a closed circuit. "
-                 "Follow those wires again and use the same net name on every part they reach.")
-        second = chat(model, SYSTEM, retry, schema, image=image, tokens=1600, large=True)
-        if second.get("components") and len(_dangling_nets(second.get("components"))) < len(dangling):
+                 f"{', '.join(dangling)} connected to only one component pin. "
+                 "Check whether each terminal is intentionally open or whether a visible wire was missed. "
+                 "Keep intentional opens and use the same name on every pin reached by a visible wire.")
+        try:
+            second = chat(model, SYSTEM, retry, schema, **options)
+        except (RuntimeError, ValueError):
+            second = {}
+        if second.get("components") and len(_dangling_nets(second["components"])) < len(dangling):
             reply = second
     source, notes = _text_and_notes(reply)
     components = reply.get("components")
@@ -858,9 +880,28 @@ def read_circuit(image, model, problem=None):
         # A reader sometimes lists the ground symbol or a net label as a part.
         components = [part for part in components if isinstance(part, dict) and isinstance(part.get("reference"), str)
                       and re.fullmatch(r"\s*[RCLDVIrcldvi]\d{1,3}\s*", part["reference"])]
+        labels, normalized, variants = {}, [], {}
         for part in components:
-            if isinstance(part.get("value"), str) and part["reference"].strip()[0] in "VIvi":
-                part["value"] = re.sub(r"(?<=\d)\s*[VA]$", "", part["value"].strip())  # "5V" -> "5"
+            value, nets = part.get("value"), part.get("nets")
+            if isinstance(value, str) and part["reference"].strip()[0] in "VIvi":
+                value = re.sub(r"(?<=\d)\s*[VA]$", "", value.strip())  # "5V" -> "5"
+            if isinstance(nets, list):
+                net_labels = []
+                for net in nets:
+                    if not isinstance(net, str):
+                        net_labels.append(net)
+                        continue
+                    net = net.strip()
+                    label = labels.setdefault(net.casefold(), net)
+                    if label != net:
+                        variants[net] = label
+                    net_labels.append(label)
+                nets = net_labels
+            normalized.append({**part, "value": value, "nets": nets})
+        components = normalized
+        if variants:
+            description = ", ".join(f"{net!r} as {label!r}" for net, label in variants.items())
+            notes = (*notes, f"Net names matched ignoring case: {description}. Verify the labels on the sketch.")
     directive = reply.get("directive") if isinstance(reply.get("directive"), str) else ""
     return source, notes, components or [], directive
 
@@ -868,14 +909,17 @@ def read_circuit(image, model, problem=None):
 def _circuit_file(components, directive, target):
     """The schematic file for the app: an LTspice .asc, or a KiCad .sch (whose diode pins are cathode first)."""
     if target == "KiCad":
-        parts = [{**part, "reference": part["reference"].strip().upper(),
-                  "nets": part["nets"][::-1] if part["reference"].strip().upper().startswith("D") else part["nets"]}
-                 for part in components]
+        parts = []
+        for part in components:
+            reference, nets = part["reference"].strip().upper(), part.get("nets")
+            if reference.startswith("D") and isinstance(nets, list):
+                nets = nets[::-1]
+            parts.append({**part, "reference": reference, "nets": nets})
         return build_schematic(parts)
     return build_asc(components, directive)
 
 
-def circuit_draft(image, model, target="LTspice", check=None):
+def circuit_draft(image, model, target="LTspice", check=None, *, evidence=None):
     """Read a circuit sketch into a schematic for LTspice (.asc) or KiCad (.sch).
 
     The parts and nets come from one reading (see read_circuit); the file is built from them here, so
@@ -883,7 +927,7 @@ def circuit_draft(image, model, target="LTspice", check=None):
     finished file through the simulator and returns (ok, lines); when it fails, the error goes back
     with the drawing for one corrected reading, and the better of the two is kept."""
     extension = ".sch" if target == "KiCad" else ".asc"
-    source, notes, components, directive = read_circuit(image, model)
+    source, notes, components, directive = read_circuit(image, model, evidence=evidence)
     if not components:
         return Draft(source, "", notes, extension)
     try:
@@ -901,7 +945,7 @@ def circuit_draft(image, model, target="LTspice", check=None):
     netlist, checked = simulated(components, directive)
     if checked is not None and not checked[0]:
         try:
-            second = read_circuit(image, model, (netlist, " ".join(checked[1][:3])))
+            second = read_circuit(image, model, (netlist, " ".join(checked[1][:3])), evidence=evidence)
             again = _circuit_file(second[2], second[3], target) if second[2] else ""
             renetlist, rechecked = simulated(second[2], second[3]) if again else ("", None)
         except (RuntimeError, ValueError):
@@ -932,7 +976,8 @@ def convert_page(frame, target, language, model, workflow="default", evidence=No
     math = target in ("VS Code", "MATLAB", "LaTeX") and workflow not in ("project", "architecture")
     image = _image_bytes(frame, enhance=math)
     if target in ("KiCad", "LTspice"):
-        return circuit_draft(image, model, target, check)
+        ink = _image_bytes(evidence) if evidence is not None and evidence.shape[:2] == frame.shape[:2] else None
+        return circuit_draft(image, model, target, check, evidence=ink)
 
     properties = PROPERTIES
     if math or workflow == "idea":

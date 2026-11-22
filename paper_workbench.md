@@ -4,7 +4,11 @@ Start the workbench from the project directory.
 
     uv run paper_workbench.py
 
-Choose an app icon on page 1 and press the key for what you're about to write, such as **Code**, **Plot**, or **Equation**. If the camera is off, that key starts it; **Camera**, the top-left key on every app page, turns it on and off by hand. The key captures a reference frame and starts tracking. The green box shows the detected paper or the writing area you selected by dragging in the preview. The yellow line shows hand motion. A magenta crosshair marks the pen tip, estimated from the thumb–index grip along the pen axis and snapped to the visible nib when the shaft can be seen (filled center). Blue lines are the registered pen-down strokes: a tip sample counts only when new ink appears under it, so hover moves are left out. Keep the paper still while you write.
+Press **Ctrl+Alt+F9** to switch between PaperBridge and the virtual keyboard,
+touchpad, gaze, and lip-reading tools. In the integrated workspace, the MX Keypad
+webcam key switches directly to PaperBridge. See the [workspace guide](README.md#switch-between-camera-tools).
+
+Choose an app icon on page 1 and press the key for what you're about to write, such as **Code**, **Plot**, **Equation**, or **Schematic**. That starts the camera if needed and captures a reference frame. **Camera** turns the stream on or off. The green box shows the detected paper or the writing area you selected by dragging. Yellow lines show hand motion, the magenta crosshair marks a visible nib supported by edges inside the capture area, and blue lines show pen-down strokes. If PaperBridge cannot locate the writing area at the end of a recording, it asks for a still or manual selection. Pass `--debug-capture` to save full-frame diagnostics and replay files for troubleshooting.
 
 To finish, draw a small closed circle after the text, apart from it and a bit larger than your letters, and hold still briefly. The orange ring confirms it, and generation starts without a key press. The circle itself is not transcribed. For **Diagram** and **Copy** a circle is part of the content, so finish those by moving your hand away or pressing the key again. That also works for every other key.
 

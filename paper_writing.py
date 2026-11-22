@@ -14,10 +14,22 @@ from typing import Optional
 import cv2
 import numpy as np
 
-from paper_pen import (OneEuro, PenTip, PenTipTracker, blend_colour, find_bars, find_closed_loop, find_pen,
-                       hue_distance, pen_grip, render_strokes, stroke_bounds)
-from paper_selection import PaperSelection, select_paper_region
 from paper_motion import sheet_motion
+from paper_pen import (
+    OneEuro,
+    PenTip,
+    PenTipTracker,
+    blend_colour,
+    capture_contains,
+    find_bars,
+    find_closed_loop,
+    find_pen,
+    hue_distance,
+    pen_grip,
+    render_strokes,
+    stroke_bounds,
+)
+from paper_selection import PaperSelection, select_paper_region
 from paper_trace import ink_strokes
 
 INK_DELTA = 28  # Gray levels a pixel must darken against the reference frame to count as ink.
@@ -201,24 +213,22 @@ class WritingSession:
             if found is not None and side != pen_side:
                 grip, _, radius, _ = found
                 x, y = point = tuple(int(v) for v in np.rint(grip))
-                inside = not self.area or (self.area[0] <= x < self.area[2] and self.area[1] <= y < self.area[3])
+                inside = capture_contains((x, y), frame.shape, self.area)
                 # Without a visible barrel the tip is estimated from the grip (thumb and index along the pen).
                 if inside and guess and now - self.last_path.get(side, 0.0) >= 0.03:
                     self.path.append((now, side, point, radius))
                     self.last_path[side] = now
                     # The tip is followed even between recordings: a snapshot reads what it points at.
-                    tip = self.tracker.update(side, hand, frame, now)
-                    if tip is not None:
+                    tip = self.tracker.update(side, hand, frame, now, inside=self.area, surface=self.sheet_mask)
+                    if tip is not None and capture_contains(self._nib(tip), frame.shape, self.area, self.sheet_mask):
                         self.current_tips[side] = now, tip
                         if self.reference is not None:
-                            if self._contains(tip.point):
-                                wrist = hand.get("landmarks") or ()
-                                wrist = tuple(wrist[0]["pixel"]) if wrist else None
-                                point = tuple(int(round(v)) for v in np.add(tip.point, self.tip_offset))
-                                self.tips.setdefault(side, deque(maxlen=3000)).append(
-                                    TipSample(now, point, tip.visual, wrist=wrist))
+                            wrist = hand.get("landmarks") or ()
+                            wrist = tuple(wrist[0]["pixel"]) if wrist else None
+                            self.tips.setdefault(side, deque(maxlen=3000)).append(
+                                TipSample(now, self._nib(tip), tip.visual, wrist=wrist))
             occluders.append(self._occluder(hand, side, now))
-        fresh = [tip for time, tip in self.current_tips.values() if time == now]
+        fresh = [tip for time, tip in self.current_tips.values() if time == now and tip.visual]
         if fresh:
             self.nib_trail.append((now, self._nib(fresh[0])))
         if hands or pen is not None:
@@ -242,10 +252,6 @@ class WritingSession:
         quick and keeps to the same pen, then anywhere around the sheet."""
         height, width = frame.shape[:2]
         colour = WritingSession.pen_colour
-        inside = None
-        if self.area is not None:
-            x0, y0, x1, y1 = self.area
-            inside = (x0 - 60, y0 - 60, x1 + 60, y1 + 60)  # The nib is over the sheet; the back may stick out.
         previous = self.pen if self.pen is not None and self.pen_seen is not None and now - self.pen_seen < 0.6 else None
         if previous is not None:
             reach = 3 * previous.width + 90
@@ -253,11 +259,11 @@ class WritingSession:
             window = (max(0, min(xs) - reach), max(0, min(ys) - reach), min(width, max(xs) + reach),
                       min(height, max(ys) + reach))
             pen = find_pen(frame, window, hands, colour=colour, previous=previous, ignore=self.still_bars,
-                           inside=inside)
+                           inside=self.area, surface=self.sheet_mask)
             if pen is not None:
                 return pen
         return find_pen(frame, self._pen_region(frame.shape), hands, colour=colour, previous=previous,
-                        ignore=self.still_bars, inside=inside)
+                        ignore=self.still_bars, inside=self.area, surface=self.sheet_mask)
 
     def _pen_region(self, shape):
         """Where to look for the pen: around the sheet (or the writing area), and around where it was."""
@@ -313,6 +319,8 @@ class WritingSession:
             # The landmark is on the point itself. (A pen whose point the fingers hide gives none: the end of
             # the hand on the pen's line is only a guess, kept below as an estimated sample.)
             point = self.pen_filters.setdefault(side, OneEuro(min_cutoff=4.0, beta=0.06))(now, pen.point)
+            if not capture_contains(np.rint(point), frame.shape, self.area, self.sheet_mask, margin=2):
+                point = pen.point
             tip = PenTip(tuple(int(v) for v in np.rint(point)), pen.back, int(2 * pen.width),
                          max(8.0, 4 * pen.width), True)
             self.current_tips[side] = now, tip
@@ -322,8 +330,8 @@ class WritingSession:
         if now - self.last_path.get(side, 0.0) < 0.03:
             return
         self.last_path[side] = now
-        self.path.append((now, side, pen.back, int(2 * pen.width)))
-        if self.reference is not None and self._contains(sample):
+        self.path.append((now, side, sample, int(2 * pen.width)))
+        if self.reference is not None and capture_contains(sample, frame.shape, self.area, self.sheet_mask):
             # The back of the barrel stands in for the wrist: back-to-nib points away from the writer.
             shown, x, y = getattr(self, "_shown", None), int(sample[0]), int(sample[1])
             inside = 0 <= y < frame.shape[0] and 0 <= x < frame.shape[1]
@@ -725,11 +733,13 @@ class WritingSession:
             else:
                 canvas[self.ink_count >= 1] = (205, 110, 25)
         # The nib's path over the last moments (not the hand's), and the barrel the nib was found on.
-        trail = [(t, point) for t, point in self.nib_trail if now - t <= 1.4]
+        trail = [(t, point) for t, point in self.nib_trail
+                 if now - t <= 1.4 and capture_contains(point, frame.shape, self.area, self.sheet_mask)]
         for (previous, start), (current, end) in zip(trail, trail[1:]):
             if current - previous < 0.25 and np.linalg.norm(np.subtract(start, end)) < 110:
                 cv2.line(canvas, start, end, (60, 210, 245), 3, cv2.LINE_AA)
-        if self.pen is not None and self.pen_seen is not None and now - self.pen_seen < 0.25:
+        if (self.pen is not None and self.pen.tapered and self.pen_seen is not None and now - self.pen_seen < 0.25
+                and capture_contains(self.pen.point, frame.shape, self.area, self.sheet_mask, margin=2)):
             cv2.line(canvas, self.pen.back, self.pen.point, (60, 210, 245), 2, cv2.LINE_AA)
         for side in ("Left", "Right", "Pen"):
             if self.ink_count is None:
@@ -737,10 +747,11 @@ class WritingSession:
                     cv2.polylines(canvas, [np.asarray([s.point for s in stroke], np.int32)], False,
                                   (205, 110, 25), 2, cv2.LINE_AA)
             recent = self.current_tips.get(side)
-            if recent is not None and now - recent[0] < 0.25:
+            if recent is not None and recent[1].visual and now - recent[0] < 0.25:
                 # At the nib: the tracked tip plus the offset the ink taught (see _calibrate_tip).
                 point = self._nib(recent[1])
-                self._draw_tip(canvas, replace(recent[1], point=point))
+                if capture_contains(point, frame.shape, self.area, self.sheet_mask, margin=2):
+                    self._draw_tip(canvas, replace(recent[1], point=point))
         if self.end_circle is not None:
             center = tuple(int(round(v)) for v in self.end_circle.center)
             cv2.circle(canvas, center, int(round(self.end_circle.radius * 1.3)), (0, 140, 255), 3, cv2.LINE_AA)
@@ -748,7 +759,7 @@ class WritingSession:
 
     @staticmethod
     def _draw_tip(canvas, tip):
-        """Magenta crosshair at the pen tip: filled when the shaft is seen, hollow when estimated."""
+        """Magenta crosshair at the observed pen tip."""
         x, y = tip.point
         size = max(9, canvas.shape[1] // 150)
         for color, width in (((25, 25, 25), 4), ((230, 40, 230), 2)):
@@ -757,8 +768,7 @@ class WritingSession:
             cv2.line(canvas, (x + size + 2, y), (x + 2 * size, y), color, width, cv2.LINE_AA)
             cv2.line(canvas, (x, y - 2 * size), (x, y - size - 2), color, width, cv2.LINE_AA)
             cv2.line(canvas, (x, y + size + 2), (x, y + 2 * size), color, width, cv2.LINE_AA)
-        if tip.visual:
-            cv2.circle(canvas, (x, y), 3, (230, 40, 230), -1, cv2.LINE_AA)
+        cv2.circle(canvas, (x, y), 3, (230, 40, 230), -1, cv2.LINE_AA)
 
     # Selection -----------------------------------------------------------------------------------
 
@@ -1473,12 +1483,9 @@ class WritingSession:
         return self._nib(tip)
 
     def _on_sheet(self, point):
-        x, y = (int(round(v)) for v in point)
         if self.sheet_mask is not None:
-            height, width = self.sheet_mask.shape
-            return 0 <= x < width and 0 <= y < height and bool(
-                self.sheet_mask[max(0, y - 20):y + 21, max(0, x - 20):x + 21].any())
-        return self._contains((x, y))
+            return capture_contains(point, self.sheet_mask.shape, self.area, self.sheet_mask)
+        return self._contains(point)
 
     def hidden_mask(self, shape):
         """0/1 map of the page covered by the hand and pen, as last seen."""

@@ -140,6 +140,11 @@ class SheetTracker:
         self.domain[max(0, top):max(0, bottom), max(0, left):max(0, right)] = 1
         self.key, self.known = self._landmarks(reference, hidden)
         self.known &= self.domain
+        left, top, right, bottom = (int(round(v * self.SCALE)) for v in self.box)
+        self._sheet_slice = (slice(max(0, top), min(self.small[1], bottom)),
+                             slice(max(0, left), min(self.small[0], right)))
+        sheet = self.known[self._sheet_slice]
+        self._covered_reference = bool(sheet.size and np.mean(sheet) < 0.45)
         self.pose = np.eye(3)
         self.state = "steady"
         self.moves = self.rekeyed = self.lost = self.updates = 0
@@ -398,6 +403,15 @@ class SheetTracker:
             still = float(np.abs(picture - self._picture)[shared].sum()) < 0.2 * max(float(picture[shared].sum()), 1.0)
         self._picture, self._seen = picture, seen
         self.updates += 1
+        if self._covered_reference and still and np.mean(seen[self._sheet_slice]) >= 0.65:
+            # Desk patches can remain aligned even when the initial view was mostly a hand.
+            # Wait for a stable view of the paper before trusting its reference.
+            self.key, self.known = picture, seen & self.domain
+            self.pose = np.eye(3)
+            self._covered_reference = False
+            self.rekeyed += 1
+            self.tied = False
+            return self._settle("held")
         corners = self._corners(self.key, self.known)
         before = self._scaled(self.pose)
         here = self._measure(self.key, self.known, corners, picture, seen, before, 12)
@@ -453,6 +467,7 @@ class SheetTracker:
                     self.known |= here["visible"] & self.domain
                     self.rekeyed += 1
                     self.tied = False
+                    self._covered_reference = False
                     return self._settle("held")
                 self.state = "lost"
                 return self.state
